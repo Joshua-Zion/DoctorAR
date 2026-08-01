@@ -33,7 +33,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   effectsEnabled: true,
   particlesEnabled: true,
   soundEnabled: false,
-  soundVolume: 0.2,
+  soundVolume: 0.3,
   debugEnabled: false,
   theme: 'ember',
   effectScale: 1,

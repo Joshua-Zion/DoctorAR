@@ -43,6 +43,14 @@ const EXTEND_EXIT = 0.52
 const mean = (values: readonly number[]): number =>
   values.length === 0 ? 0 : values.reduce((sum, value) => sum + value, 0) / values.length
 
+export const getHandExtensionScore = (hand: TrackedHand): number => saturate((
+  4 -
+  hand.fingers.index.curl -
+  hand.fingers.middle.curl -
+  hand.fingers.ring.curl -
+  hand.fingers.pinky.curl
+) * 0.25)
+
 const negate = (value: Vector3Like): Vector3Like => ({ x: -value.x, y: -value.y, z: -value.z })
 
 const scale = (value: Vector3Like, amount: number): Vector3Like => ({
@@ -104,21 +112,31 @@ export class GestureRecognizer {
       : 0
     const distanceVelocity = previous && elapsed > 0 ? (distance - previous.distance) / elapsed : 0
     this.previousTwoHandTimestamp = timestampMs
-    const oppositionScore = saturate((1 - dot3(left.palm.normal, right.palm.normal)) * 0.5)
-    const bothOpen = Math.min(left.scores.open, right.scores.open)
-    const distanceGate = 1 - Math.abs(clamp(
-      (distance - GESTURE_CONFIG.twoHand.minDistance) /
-        (GESTURE_CONFIG.twoHand.maxDistance - GESTURE_CONFIG.twoHand.minDistance),
-      0,
-      1,
-    ) - 0.5) * 0.28
+    const inwardFacingScore = saturate((1 - dot3(left.palm.normal, right.palm.normal)) * 0.5)
+    const cameraFacingScore = Math.min(left.palm.facingScore, right.palm.facingScore)
+    // Two palms may either face each other or remain angled toward the camera.
+    // Keep the downstream field name for compatibility, but make it represent
+    // the strongest supported two-hand orientation instead of opposition only.
+    const oppositionScore = Math.max(inwardFacingScore, cameraFacingScore)
+    const bothLongFingersOpen = Math.min(getHandExtensionScore(left), getHandExtensionScore(right))
+    const verticalGap = Math.abs(left.palm.center.y - right.palm.center.y)
+    const distanceReady = distance >= GESTURE_CONFIG.twoHand.minDistance &&
+      distance <= GESTURE_CONFIG.twoHand.maxDistance
+    const inwardPoseReady = inwardFacingScore >= GESTURE_CONFIG.twoHand.inwardFacingScore
+    const frontPoseReady =
+      cameraFacingScore >= GESTURE_CONFIG.twoHand.frontFacingScore &&
+      distance <= GESTURE_CONFIG.twoHand.frontMaxDistance &&
+      verticalGap <= GESTURE_CONFIG.twoHand.maxVerticalGap
 
     return {
       center,
       distance,
       distanceVelocity,
       oppositionScore,
-      ready: Math.min(bothOpen, oppositionScore * 0.72 + distanceGate * 0.28) >= GESTURE_CONFIG.twoHand.enterScore,
+      ready:
+        distanceReady &&
+        bothLongFingersOpen >= GESTURE_CONFIG.twoHand.longFingerScore &&
+        (inwardPoseReady || frontPoseReady),
     }
   }
 
@@ -220,7 +238,7 @@ export class GestureRecognizer {
       landmarks[HAND_LANDMARK.THUMB_TIP],
       landmarks[HAND_LANDMARK.INDEX_TIP],
     )
-    const pinch = 1 - inverseLerp(0.18, 0.62, pinchDistance / Math.max(palm.width, 1e-4))
+    const pinch = 1 - inverseLerp(0.2, 0.72, pinchDistance / Math.max(palm.width, 1e-4))
     return { open, fist, pinch: saturate(pinch) }
   }
 

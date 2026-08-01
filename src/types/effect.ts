@@ -14,5 +14,7 @@ export interface EffectRuntimeSettings {
 export interface EffectStats {
   renderMs: number
   activeParticles: number
+  activeTrailSegments: number
+  activeShockwaves: number
   drawCalls: number
 }

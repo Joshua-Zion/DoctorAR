@@ -2,8 +2,11 @@ import { GESTURE_CONFIG } from '../config/gestureConfig'
 import type { GesturePose, HandGestureSnapshot } from '../types/gesture'
 import type { HandFrame, Handedness, TrackedHand } from '../types/hand'
 import { saturate } from '../utils/math'
+import { midpoint3 } from '../utils/vector'
 import { GestureEventBus } from './GestureEventBus'
+import { getHandExtensionScore } from './GestureRecognizer'
 import { GestureStateMachine, type GestureStateUpdate } from './GestureStateMachine'
+import { TwoHandReleaseDetector } from './TwoHandReleaseDetector'
 
 export interface GestureProcessOptions {
   sensitivity?: number
@@ -43,6 +46,10 @@ export class GestureCoordinator {
     right: createHandMachines(),
   }
   private readonly twoHand = new GestureStateMachine({ ...GESTURE_CONFIG.twoHand })
+  private readonly twoHandRelease = new TwoHandReleaseDetector({
+    releaseVelocity: GESTURE_CONFIG.twoHand.releaseVelocity,
+    cooldownMs: GESTURE_CONFIG.twoHand.cooldownMs,
+  })
   private snapshots: HandGestureSnapshot[] = []
 
   constructor(eventBus: GestureEventBus) {
@@ -69,19 +76,23 @@ export class GestureCoordinator {
         confidence,
         present,
         sensitivity,
-        cooldownMs,
       })
-      const fistUpdate = machines.fist.update({
+      const pinchScore = hand?.scores.pinch ?? 0
+      const fistScore = hand?.scores.fist ?? 0
+      const pinchOwnsPose = pinchScore >= Math.max(0.52, fistScore - 0.08)
+      const pinchUpdate = machines.pinch.update({
         timestamp: frame.timestamp,
-        score: hand?.scores.fist ?? 0,
+        score: pinchOwnsPose ? pinchScore : 0,
         confidence,
         present,
         sensitivity,
-        cooldownMs,
       })
-      const pinchUpdate = machines.pinch.update({
+      const pinchClaimsHand = (
+        pinchUpdate.phase === 'candidate' || pinchUpdate.phase === 'active'
+      )
+      const fistUpdate = machines.fist.update({
         timestamp: frame.timestamp,
-        score: hand?.scores.pinch ?? 0,
+        score: pinchClaimsHand ? 0 : hand?.scores.fist ?? 0,
         confidence,
         present,
         sensitivity,
@@ -128,6 +139,7 @@ export class GestureCoordinator {
       machines.lostEmitted = false
     }
     this.twoHand.reset()
+    this.twoHandRelease.reset()
     this.snapshots = []
   }
 
@@ -143,15 +155,21 @@ export class GestureCoordinator {
     if (open.released) this.eventBus.emit({ type: 'PALM_CLOSE', hand: hand.handedness })
 
     if (fist.activated) {
+      const intensity = Math.min(1.65, Math.max(
+        1.05,
+        hand.scores.fist * 1.18 + hand.speed * 0.42,
+      ))
       this.eventBus.emit({
         type: 'FIST',
         hand: hand.handedness,
         pose,
-        intensity: saturate(hand.scores.fist + hand.speed * 0.28),
+        intensity,
       })
     }
 
-    const pinchPosition = hand.landmarks[8] ?? hand.palm.center
+    const thumbTip = hand.landmarks[4] ?? hand.palm.center
+    const indexTip = hand.landmarks[8] ?? hand.palm.center
+    const pinchPosition = midpoint3(thumbTip, indexTip)
     if (pinch.activated) this.eventBus.emit({ type: 'PINCH_START', hand: hand.handedness, position: pinchPosition })
     if (pinch.phase === 'active') this.eventBus.emit({ type: 'PINCH_MOVE', hand: hand.handedness, position: pinchPosition })
     if (pinch.released) this.eventBus.emit({ type: 'PINCH_END', hand: hand.handedness })
@@ -170,13 +188,30 @@ export class GestureCoordinator {
       frame.timestamp - left.seenAt <= GESTURE_CONFIG.loss.holdMs &&
       frame.timestamp - right.seenAt <= GESTURE_CONFIG.loss.holdMs,
     )
-    const bothOpen = left && right ? Math.min(left.scores.open, right.scores.open) : 0
+    const bothFreshForRelease = Boolean(
+      left && right &&
+      frame.timestamp - left.seenAt <= 60 &&
+      frame.timestamp - right.seenAt <= 60,
+    )
+    const bothExtended = left && right
+      ? Math.min(getHandExtensionScore(left), getHandExtensionScore(right))
+      : 0
     const distanceReady = metric
       ? metric.distance >= GESTURE_CONFIG.twoHand.minDistance && metric.distance <= GESTURE_CONFIG.twoHand.maxDistance
       : false
-    const score = metric && distanceReady && metric.ready
-      ? saturate(bothOpen * 0.58 + metric.oppositionScore * 0.42)
+    const activeHoldReady = Boolean(
+      metric &&
+      bothFresh &&
+      metric.distance >= GESTURE_CONFIG.twoHand.activeMinDistance &&
+      metric.distance <= GESTURE_CONFIG.twoHand.activeMaxDistance &&
+      bothExtended >= GESTURE_CONFIG.twoHand.activeLongFingerScore
+    )
+    const entryScore = metric && distanceReady && metric.ready
+      ? saturate(bothExtended * 0.68 + metric.oppositionScore * 0.32)
       : 0
+    const score = this.twoHand.phase === 'active'
+      ? activeHoldReady ? 1 : 0
+      : entryScore
     const confidence = left && right ? Math.min(left.trackingQuality, right.trackingQuality) : 0
 
     const update = this.twoHand.update({
@@ -185,7 +220,32 @@ export class GestureCoordinator {
       confidence,
       present: Boolean(metric && bothFresh),
       sensitivity,
-      cooldownMs,
+    })
+
+    const aspectY = frame.videoHeight / Math.max(1, frame.videoWidth)
+    const axisX = left && right ? right.palm.center.x - left.palm.center.x : 0
+    const axisY = left && right ? (right.palm.center.y - left.palm.center.y) * aspectY : 0
+    const axisLength = Math.hypot(axisX, axisY)
+    const relativeVelocityX = left && right ? right.velocity.x - left.velocity.x : 0
+    const relativeVelocityY = left && right ? (right.velocity.y - left.velocity.y) * aspectY : 0
+    const outwardVelocity = axisLength > 0.0001
+      ? (relativeVelocityX * axisX + relativeVelocityY * axisY) / axisLength
+      : 0
+
+    const releaseObservationValid = Boolean(
+      metric &&
+      bothFreshForRelease &&
+      (update.phase === 'active' || metric.ready)
+    )
+    const release = this.twoHandRelease.update({
+      timestamp: frame.timestamp,
+      distance: metric?.distance ?? 0,
+      distanceVelocity: metric?.distanceVelocity,
+      outwardVelocity,
+      chargeActive: update.phase === 'candidate' || update.phase === 'active',
+      releaseEnabled: update.phase === 'active',
+      valid: releaseObservationValid,
+      resetVelocityOnRecovery: !releaseObservationValid,
     })
 
     if (metric && update.activated) {
@@ -200,10 +260,10 @@ export class GestureCoordinator {
         velocity: metric.distanceVelocity,
       })
 
-      if (metric.distanceVelocity >= GESTURE_CONFIG.twoHand.releaseVelocity) {
-        this.eventBus.emit({ type: 'TWO_HAND_RELEASE', center: metric.center, velocity: metric.distanceVelocity })
+      if (release.triggered) {
         const forced = this.twoHand.forceRelease(frame.timestamp, cooldownMs)
         if (forced.released) this.eventBus.emit({ type: 'TWO_HAND_CHARGE_END' })
+        this.eventBus.emit({ type: 'TWO_HAND_RELEASE', center: metric.center, velocity: release.filteredVelocity })
         return
       }
     }

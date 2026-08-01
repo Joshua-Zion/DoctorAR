@@ -10,26 +10,28 @@
 
 这些是验收目标，不是未经测试即可声称的结果。每次发布必须记录参考硬件和真实测量。
 
-## 2. V1 调度策略
+## 2. V1 / V1.1 调度策略
 
-- 推理只在视频产生新帧时运行，避免对同一帧重复 detectForVideo。
+- 推理优先由 `requestVideoFrameCallback` 在视频产生新帧时运行，避免对同一帧重复 `detectForVideo`；不支持时回退 requestAnimationFrame。
 - 推理频率与 requestAnimationFrame 渲染频率分离。
+- 视频帧按预设输入长边缩放为可转移 `ImageBitmap`，交给 Worker 内的 MediaPipe Hand Landmarker。
+- 主线程与 Worker 间只允许单个 in-flight 请求；Worker 忙碌时丢弃新推理帧并计数，不排队累积延迟。
 - React 只处理低频 UI 状态，手部姿态和 Shader uniform 不走逐帧 setState。
 - 调试文本节流刷新。
-- 粒子采用预分配数据、BufferGeometry 或对象复用，并有活动数量硬上限。
+- 粒子、轨迹段和冲击波采用固定容量 BufferGeometry / 槽位复用，并有分档活动数量硬上限。
 - Renderer DPR 有上限，窗口改变时统一更新尺寸。
 - document.hidden 时暂停推理、粒子发射和非必要统计。
 
-## 3. 主线程限制
+## 3. Worker 与主线程回退
 
-MediaPipe Tasks Vision Web 的 detect 和 detectForVideo 是同步调用。若 V1 在 UI 线程运行推理，即使限制频率，也可能产生短暂主线程阻塞。
+MediaPipe Tasks Vision Web 的 `detect` 和 `detectForVideo` 是同步调用。V1.1 默认在 Worker 内运行 Hand Landmarker，使同步模型调用不直接占用 UI 线程；帧准备、ImageBitmap 创建和消息处理仍有主线程成本。
 
 因此：
 
-- V1 应记录推理耗时和 Long Task，不能仅凭肉眼判断流畅。
-- 当前实现若未迁入 Worker，不得写成“推理完全不阻塞渲染”。
-- V1.1 优先评估 Worker、ImageBitmap 和可转移帧方案。
-- 如果 Worker 方案带来更高复制成本，应使用相同视频、分辨率和设备进行 A/B 测量。
+- 调试面板必须显示当前后端 `WORKER` 或 `MAIN`、Worker 往返耗时、推理 FPS 和丢弃帧数。
+- Worker 初始化或首次运行失败时只执行一次受控主线程回退；回退固定限制为最高 18 FPS 和低档输入尺寸，但同步推理仍可能产生短帧。
+- 单 in-flight 只保证不积压旧帧，不代表端到端视觉延迟已在所有设备低于 100 ms。
+- Worker 与主线程回退应使用相同视频、分辨率和设备进行 A/B 测量，不能只凭肉眼判断流畅。
 
 ## 4. 性能统计定义
 
@@ -38,6 +40,10 @@ MediaPipe Tasks Vision Web 的 detect 和 detectForVideo 是同步调用。若 V
 - Render time：更新 Three.js 场景到 renderer.render 返回的 CPU 时间。
 - Visual latency：从可观察手势变化到对应特效变化的录屏帧差；内部事件耗时不能替代端到端延迟。
 - Active particles：当前参与更新和绘制的粒子数，不含空闲池。
+- Worker round trip：从提交 ImageBitmap 到收到 Worker 结果的耗时，包含 Worker 推理与消息往返。
+- Inference FPS：实际完成的推理次数除以统计窗口秒数。
+- Dropped inference frames：由于已有请求在途而主动跳过的新视频帧累计数。
+- Active trail segments / shockwaves：当前可见的轨迹段与冲击波实例数，不含空闲槽位。
 
 统计窗口至少 1 秒，展示值使用滑动平均，避免单帧噪声。
 
@@ -52,7 +58,15 @@ MediaPipe Tasks Vision Web 的 detect 和 detectForVideo 是同步调用。若 V
 - Hand Landmarker 模型版本和推理频率。
 - 粒子上限、主题和调试开关。
 
-默认基准建议使用当前稳定版 Chrome 或 Edge、1280 × 720 摄像头、Balanced 思路的粒子数量以及关闭调试层。Low、Balanced、High 已可切换并实际调整推理频率、DPR 和粒子上限，但仍不得在缺少真实硬件数据时声称三档已经完成性能标定。
+默认基准建议使用当前稳定版 Chrome 或 Edge、1280 × 720 摄像头、Balanced 配置以及关闭调试层。当前三档限制如下：
+
+| 预设 | 推理上限 | 输入长边 | DPR 上限 | 粒子总上限 | 单次爆裂 | 轨迹段 | 轨迹间距 | 冲击波 | 默认摄像头 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Low | 18 FPS | 512 px | 1.0 | 360 | 200 | 96 | 7 px | 2 | 480p |
+| Balanced | 28 FPS | 640 px | 1.5 | 720 | 320 | 192 | 4.5 px | 4 | 720p |
+| High | 40 FPS | 960 px | 2.0 | 1200 | 420 | 320 | 3.5 px | 6 | 1080p |
+
+三档参数已经真实生效，但仍不得在缺少真实硬件数据时声称已完成跨设备性能标定。
 
 ## 6. V1 发布测试
 
@@ -99,11 +113,12 @@ MediaPipe Tasks Vision Web 的 detect 和 detectForVideo 是同步调用。若 V
 
 1. TypeScript 检查。
 2. lint。
-3. production build。
-4. production preview。
-5. 浏览器控制台错误检查。
-6. Network 面板检查，确认摄像头帧未上传。
-7. 页面隐藏/恢复和退出后的资源释放检查。
+3. Vitest 41 项手势、视觉、音频与 Worker 生命周期测试。
+4. production build。
+5. production preview。
+6. 浏览器控制台错误检查。
+7. Network 面板检查，确认摄像头帧未上传。
+8. 页面隐藏/恢复和退出后的资源释放检查。
 
 开发服务器成功不等于生产成功；必须确认 production preview 中本地 model、WASM 和 Shader 路径有效。
 
@@ -113,20 +128,21 @@ MediaPipe Tasks Vision Web 的 detect 和 detectForVideo 是同步调用。若 V
 - 摄像头约束是请求偏好，实际分辨率以 videoWidth、videoHeight 和 track settings 为准。
 - requestAnimationFrame 在后台标签页通常暂停或节流。
 - 全屏需要用户激活，并可能因 Esc、切换标签页或系统切换而退出。
-- 后续 Web Audio 必须由用户交互解锁。
+- Web Audio 必须由用户交互解锁。
 
 ## 9. 尚未记录的结果
 
-当前文档不虚构具体硬件成绩。最终 V1 浏览器验收完成后，应在此追加一张带日期、硬件、浏览器、分辨率、FPS、推理耗时、渲染耗时和粒子峰值的结果表。
+当前文档不虚构具体硬件成绩。最终真实设备验收完成后，应在此追加一张带日期、硬件、浏览器、分辨率、后端、FPS、Worker 往返耗时、推理耗时、渲染耗时、丢帧、粒子、轨迹和冲击波峰值的结果表。
 
-## 10. 2026-07-31 production smoke
+## 10. 2026-08-01 自动验证记录
 
-已在 Windows 系统 Chrome 的无头模式中使用浏览器假摄像头完成一次 production preview 功能烟测：
+Vitest 共 41 项通过，覆盖双手严格进入姿态与候选连续性、跨帧率快速展开、噪声与漏帧、候选/激活和重识别保护、捏合/握拳仲裁、MOVE-only 轨迹恢复、粒子密度、音频解锁，以及 Worker reset 旧结果隔离。
 
-- 实际视频输入为 640 × 480。
-- 本地 Hand Landmarker 模型与 WASM 成功加载。
-- WebGL 特效 Canvas 成功创建，系统进入 `LOCAL VISION · ACTIVE`。
-- 调试面板和蓝色主题切换生效。
-- 未捕获运行时异常、`console.error` 或网络资源加载失败。
+Windows 无头 Edge 假摄像头生产预览烟测确认：
 
-该环境使用 SwiftShader 软件图形，推理和渲染数字不代表真实电脑与摄像头性能，因此本次结果只证明启动闭环和生产资源路径，不计入 30 FPS 或 100 ms 目标验收。真实摄像头手势、60 秒基准和 15 分钟持续运行仍待真机完成。
+- 本地 Hand Landmarker 模型与 WASM 成功加载，调试面板后端为 `WORKER`。
+- 真实用户激活语义下 AudioContext 状态为 `ready`；烟测未使用自动播放绕过参数。
+- 密集爆裂、MOVE-only 捏合轨迹和冲击波进入真实 Three.js / WebGL 绘制路径，累计峰值指标非零，不是静态占位图。
+- 未捕获页面控制台错误或失败的网络资源请求。
+
+假摄像头与无头软件图形环境不代表真实摄像头、真实 GPU 或跨浏览器性能，因此本次结果只证明开发环境启动、Worker 和 V1.1 实绘闭环。真实摄像头手势、60 秒基准、15 分钟持续运行和跨浏览器验证仍待完成。

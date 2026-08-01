@@ -81,6 +81,32 @@ export interface AmbientSparkOptions {
   nowSeconds: number
 }
 
+export interface ParticleBurstCountOptions {
+  amount: number
+  intensity: number
+  activeLimit: number
+  burstLimit: number
+}
+
+/** Keeps hand bursts dense while preserving a hard per-frame overdraw budget. */
+export const calculateParticleBurstCount = ({
+  amount,
+  intensity,
+  activeLimit,
+  burstLimit,
+}: ParticleBurstCountOptions): number => {
+  const normalizedAmount = Math.max(0, Math.min(1.5, amount))
+  const normalizedIntensity = Math.max(0.25, Math.min(2.5, intensity))
+  const density = 70 + normalizedAmount * 128
+  const intensityScale = 0.82 + normalizedIntensity * 0.28
+  const requested = Math.max(24, Math.round(density * intensityScale))
+  return Math.min(
+    requested,
+    Math.max(1, Math.floor(activeLimit)),
+    Math.max(1, Math.floor(burstLimit)),
+  )
+}
+
 /**
  * A single fixed-size GPU point cloud. Particle trajectories are evaluated in
  * the vertex shader; the CPU only allocates slots and reclaims expired ones.
@@ -102,6 +128,7 @@ export class ParticleSystem {
   private readonly colorScratch = new THREE.Color()
 
   private activeLimit: number
+  private burstLimit: number
   private count = 0
   private enabled = true
   private attributesDirty = false
@@ -111,6 +138,7 @@ export class ParticleSystem {
     this.scene = scene
     this.capacity = Math.max(1, Math.floor(capacity))
     this.activeLimit = this.capacity
+    this.burstLimit = this.capacity
     this.positions = new Float32Array(this.capacity * 3)
     this.velocities = new Float32Array(this.capacity * 3)
     this.birthTimes = new Float32Array(this.capacity)
@@ -190,6 +218,11 @@ export class ParticleSystem {
     }
   }
 
+  setBurstLimit(limit: number): void {
+    if (this.disposed) return
+    this.burstLimit = Math.max(1, Math.min(this.capacity, Math.floor(limit)))
+  }
+
   setPixelRatio(pixelRatio: number): void {
     if (this.disposed) return
     this.material.uniforms.uPixelRatio.value = Math.max(0.5, pixelRatio)
@@ -227,10 +260,12 @@ export class ParticleSystem {
   emitBurst(options: ParticleBurstOptions): void {
     if (!this.enabled || this.disposed) return
 
-    const normalizedAmount = Math.max(0, Math.min(1.5, options.amount))
-    const normalizedIntensity = Math.max(0.25, Math.min(2.5, options.intensity))
-    const requested = Math.max(10, Math.round((28 + normalizedAmount * 70) * normalizedIntensity))
-    const burstCount = Math.min(requested, this.activeLimit)
+    const burstCount = calculateParticleBurstCount({
+      amount: options.amount,
+      intensity: options.intensity,
+      activeLimit: this.activeLimit,
+      burstLimit: this.burstLimit,
+    })
 
     // Keep ambient emission from starving a high-priority burst.
     const maximumExisting = Math.max(0, this.activeLimit - burstCount)
@@ -249,8 +284,8 @@ export class ParticleSystem {
         options.y + directionY * originJitter,
         directionX * baseSpeed - directionY * lateral,
         directionY * baseSpeed + directionX * lateral,
-        0.34 + Math.random() * 0.58,
-        2.6 + Math.random() * 7.4,
+        0.42 + Math.random() * 0.62,
+        3.8 + Math.random() * 8.4,
         options.color,
         options.nowSeconds,
       )
