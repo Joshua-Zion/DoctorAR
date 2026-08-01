@@ -113,7 +113,7 @@ MediaPipe Tasks Vision Web 的 `detect` 和 `detectForVideo` 是同步调用。V
 
 1. TypeScript 检查。
 2. lint。
-3. Vitest 36 项手势、视觉、音频与 Worker 生命周期测试。
+3. Vitest 41 项手势、视觉、音频与 Worker 生命周期测试。
 4. production build。
 5. production preview。
 6. 浏览器控制台错误检查。
@@ -136,7 +136,7 @@ MediaPipe Tasks Vision Web 的 `detect` 和 `detectForVideo` 是同步调用。V
 
 ## 10. 2026-08-01 自动验证记录
 
-Vitest 共 36 项通过，覆盖跨帧率快速展开、噪声与漏帧、候选/激活和重识别保护、捏合/握拳仲裁、MOVE-only 轨迹恢复、粒子密度、音频解锁，以及 Worker reset 旧结果隔离。
+Vitest 共 41 项通过，覆盖双手严格进入姿态与候选连续性、跨帧率快速展开、噪声与漏帧、候选/激活和重识别保护、捏合/握拳仲裁、MOVE-only 轨迹恢复、粒子密度、音频解锁，以及 Worker reset 旧结果隔离。
 
 Windows 无头 Edge 假摄像头生产预览烟测确认：
 

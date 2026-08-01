@@ -119,8 +119,14 @@ export class GestureRecognizer {
     // the strongest supported two-hand orientation instead of opposition only.
     const oppositionScore = Math.max(inwardFacingScore, cameraFacingScore)
     const bothLongFingersOpen = Math.min(getHandExtensionScore(left), getHandExtensionScore(right))
+    const verticalGap = Math.abs(left.palm.center.y - right.palm.center.y)
     const distanceReady = distance >= GESTURE_CONFIG.twoHand.minDistance &&
       distance <= GESTURE_CONFIG.twoHand.maxDistance
+    const inwardPoseReady = inwardFacingScore >= GESTURE_CONFIG.twoHand.inwardFacingScore
+    const frontPoseReady =
+      cameraFacingScore >= GESTURE_CONFIG.twoHand.frontFacingScore &&
+      distance <= GESTURE_CONFIG.twoHand.frontMaxDistance &&
+      verticalGap <= GESTURE_CONFIG.twoHand.maxVerticalGap
 
     return {
       center,
@@ -130,7 +136,7 @@ export class GestureRecognizer {
       ready:
         distanceReady &&
         bothLongFingersOpen >= GESTURE_CONFIG.twoHand.longFingerScore &&
-        oppositionScore >= GESTURE_CONFIG.twoHand.orientationScore,
+        (inwardPoseReady || frontPoseReady),
     }
   }
 

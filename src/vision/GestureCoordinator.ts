@@ -199,9 +199,19 @@ export class GestureCoordinator {
     const distanceReady = metric
       ? metric.distance >= GESTURE_CONFIG.twoHand.minDistance && metric.distance <= GESTURE_CONFIG.twoHand.maxDistance
       : false
-    const score = metric && distanceReady && metric.ready
+    const activeHoldReady = Boolean(
+      metric &&
+      bothFresh &&
+      metric.distance >= GESTURE_CONFIG.twoHand.activeMinDistance &&
+      metric.distance <= GESTURE_CONFIG.twoHand.activeMaxDistance &&
+      bothExtended >= GESTURE_CONFIG.twoHand.activeLongFingerScore
+    )
+    const entryScore = metric && distanceReady && metric.ready
       ? saturate(bothExtended * 0.68 + metric.oppositionScore * 0.32)
       : 0
+    const score = this.twoHand.phase === 'active'
+      ? activeHoldReady ? 1 : 0
+      : entryScore
     const confidence = left && right ? Math.min(left.trackingQuality, right.trackingQuality) : 0
 
     const update = this.twoHand.update({

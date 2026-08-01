@@ -18,8 +18,9 @@ const createHand = (
   facingScore: number,
   openScore: number,
   longFingerCurl = 0,
+  y = 0.5,
 ): TrackedHand => {
-  const landmarks: HandLandmark[] = Array.from({ length: 21 }, () => ({ x, y: 0.5, z: 0 }))
+  const landmarks: HandLandmark[] = Array.from({ length: 21 }, () => ({ x, y, z: 0 }))
   return {
     handedness,
     handednessConfidence: 0.99,
@@ -27,7 +28,7 @@ const createHand = (
     landmarks,
     worldLandmarks: [],
     palm: {
-      center: { x, y: 0.5, z: 0 },
+      center: { x, y, z: 0 },
       width: 0.1,
       rotation: 0,
       normal,
@@ -80,5 +81,40 @@ describe('GestureRecognizer two-hand readiness', () => {
     ], null, 0)
 
     expect(metric?.ready).toBe(false)
+  })
+
+  it('rejects only partly extended hands instead of treating them as a deliberate dual pose', () => {
+    const recognizer = createRecognizer()
+    const metric = recognizer.computeTwoHandMetrics([
+      createHand('left', 0.35, { x: 1, y: 0, z: 0 }, 0, 0.286, 0.42),
+      createHand('right', 0.65, { x: -1, y: 0, z: 0 }, 0, 0.286, 0.42),
+    ], null, 0)
+
+    expect(metric?.ready).toBe(false)
+  })
+
+  it('rejects two extended hands with an ambiguous shared orientation', () => {
+    const recognizer = createRecognizer()
+    const metric = recognizer.computeTwoHandMetrics([
+      createHand('left', 0.35, { x: 1, y: 0, z: 0 }, 0, 0.286),
+      createHand('right', 0.65, { x: 1, y: 0, z: 0 }, 0, 0.286),
+    ], null, 0)
+
+    expect(metric?.ready).toBe(false)
+  })
+
+  it('requires front-facing palms to stay within the intentional interaction zone', () => {
+    const recognizer = createRecognizer()
+    const tooWide = recognizer.computeTwoHandMetrics([
+      createHand('left', 0.2, { x: 0, y: 0, z: -1 }, 1, 1),
+      createHand('right', 0.8, { x: 0, y: 0, z: -1 }, 1, 1),
+    ], null, 0)
+    const verticallySplit = recognizer.computeTwoHandMetrics([
+      createHand('left', 0.35, { x: 0, y: 0, z: -1 }, 1, 1, 0, 0.3),
+      createHand('right', 0.65, { x: 0, y: 0, z: -1 }, 1, 1, 0, 0.7),
+    ], null, 16)
+
+    expect(tooWide?.ready).toBe(false)
+    expect(verticallySplit?.ready).toBe(false)
   })
 })

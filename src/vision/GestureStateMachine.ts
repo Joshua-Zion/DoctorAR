@@ -6,6 +6,7 @@ export interface GestureStateMachineConfig {
   exitScore: number
   minHoldMs: number
   maxInterruptMs: number
+  candidateMaxInterruptMs?: number
   cooldownMs: number
   confidence: number
 }
@@ -85,7 +86,7 @@ export class GestureStateMachine {
         }
       } else {
         if (this.interruptedSince === 0) this.interruptedSince = timestamp
-        if (timestamp - this.interruptedSince >= this.config.maxInterruptMs) {
+        if (timestamp - this.interruptedSince >= (this.config.candidateMaxInterruptMs ?? this.config.maxInterruptMs)) {
           this.phaseValue = 'idle'
           this.candidateSince = 0
           this.interruptedSince = 0

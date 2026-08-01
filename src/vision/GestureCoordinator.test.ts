@@ -12,6 +12,14 @@ const fingers: FingerPoses = {
   pinky: { extended: false, curl: 0.5 },
 }
 
+const openFingers: FingerPoses = {
+  thumb: { extended: true, curl: 0.16 },
+  index: { extended: true, curl: 0.06 },
+  middle: { extended: true, curl: 0.06 },
+  ring: { extended: true, curl: 0.06 },
+  pinky: { extended: true, curl: 0.06 },
+}
+
 const createHand = (timestamp: number, pinch: number, fist = 0): TrackedHand => {
   const landmarks: HandLandmark[] = Array.from({ length: 21 }, () => ({ x: 0.3, y: 0.5, z: 0 }))
   landmarks[4] = { x: 0.2, y: 0.4, z: -0.1 }
@@ -63,6 +71,7 @@ const createOpenHand = (
       center: { x, y: 0.5, z: 0 },
       normal: { x: handedness === 'left' ? -1 : 1, y: 0, z: 0 },
     },
+    fingers: openFingers,
     scores: { open: 1, fist: 0, pinch: 0 },
     gesture: 'open',
     velocity: { x: velocityX, y: 0 },
@@ -186,6 +195,46 @@ describe('GestureCoordinator two-hand release events', () => {
     createDualFrame(340, 0.25, 1),
     createDualFrame(380, 0.33, 2),
   ]
+
+  it('requires a deliberate stable hold before starting the dual circle', () => {
+    const eventBus = new GestureEventBus()
+    const coordinator = new GestureCoordinator(eventBus)
+    const events: GestureEvent[] = []
+    eventBus.subscribe((event) => events.push(event))
+
+    coordinator.process(createDualFrame(0, 0.35, 0), { sensitivity: 0.58, cooldownMs: 10 })
+    coordinator.process(createDualFrame(120, 0.35, 0), { sensitivity: 0.58, cooldownMs: 10 })
+    expect(events.some((event) => event.type === 'TWO_HAND_CHARGE_START')).toBe(false)
+
+    coordinator.process(createDualFrame(135, 0.35, 0), { sensitivity: 0.58, cooldownMs: 10 })
+    expect(events.filter((event) => event.type === 'TWO_HAND_CHARGE_START')).toHaveLength(1)
+  })
+
+  it('restarts the entry hold after a long candidate interruption', () => {
+    const eventBus = new GestureEventBus()
+    const coordinator = new GestureCoordinator(eventBus)
+    const events: GestureEvent[] = []
+    eventBus.subscribe((event) => events.push(event))
+    const frames = [
+      createDualFrame(0, 0.35, 0),
+      createDualFrame(40, 0.35, 0),
+      createDualFrame(50, 0.35, 0),
+      createDualFrame(140, 0.35, 0),
+      createDualFrame(150, 0.35, 0),
+      createDualFrame(270, 0.35, 0),
+      createDualFrame(285, 0.35, 0),
+    ]
+    if (frames[2].twoHand) frames[2].twoHand.ready = false
+    if (frames[3].twoHand) frames[3].twoHand.ready = false
+
+    for (const frame of frames.slice(0, -1)) {
+      coordinator.process(frame, { sensitivity: 0.58, cooldownMs: 10 })
+    }
+    expect(events.some((event) => event.type === 'TWO_HAND_CHARGE_START')).toBe(false)
+
+    coordinator.process(frames.at(-1)!, { sensitivity: 0.58, cooldownMs: 10 })
+    expect(events.filter((event) => event.type === 'TWO_HAND_CHARGE_START')).toHaveLength(1)
+  })
 
   it('ends the charge before emitting one strict release event', () => {
     const eventBus = new GestureEventBus()
