@@ -36,6 +36,38 @@ const MAX_PARTICLES = Math.max(
   PERFORMANCE_PRESETS.high.particleLimit,
 )
 
+export type PinchRouteAction = 'start' | 'move' | 'end' | 'ignore'
+
+/**
+ * Mutates the small pinch routing sets and returns the visual action to run.
+ * MOVE deliberately self-heals when START was missed by an async effect load.
+ */
+export const routePinchEvent = (
+  eventType: 'start' | 'move' | 'end',
+  hand: Handedness,
+  dualActive: boolean,
+  active: Set<Handedness>,
+  blocked: Set<Handedness>,
+): PinchRouteAction => {
+  if (eventType === 'end') {
+    active.delete(hand)
+    blocked.delete(hand)
+    return 'end'
+  }
+
+  if (dualActive) return 'ignore'
+  if (eventType === 'start') {
+    // A new gesture lifecycle must not inherit a stale fist/loss block.
+    blocked.delete(hand)
+    active.add(hand)
+    return 'start'
+  }
+
+  if (blocked.has(hand)) return 'ignore'
+  active.add(hand)
+  return 'move'
+}
+
 /**
  * Owns the one transparent WebGL layer used by all V1 effects. Gesture data is
  * consumed through a structural event source, keeping this module independent
@@ -151,6 +183,7 @@ export class EffectManager {
     const preset = PERFORMANCE_PRESETS[this.settings.performanceMode]
     this.particles.setEnabled(this.settings.enabled && this.settings.particlesEnabled)
     this.particles.setLimit(preset.particleLimit)
+    this.particles.setBurstLimit(preset.particleBurstLimit)
     this.particles.setSpeedScale(this.settings.particleSpeed)
     this.pinchTrails.configure({
       enabled: this.settings.enabled,
@@ -307,21 +340,25 @@ export class EffectManager {
         break
       }
       case 'PINCH_START': {
-        if (this.dualActive || this.blockedPinches.has(event.hand)) break
-        this.activePinches.add(event.hand)
+        const action = routePinchEvent(
+          'start', event.hand, this.dualActive, this.activePinches, this.blockedPinches,
+        )
+        if (action === 'ignore') break
         this.mapPoint(event.position)
         this.pinchTrails.start(event.hand, this.mappedPoint.x, this.mappedPoint.y, nowMs)
         break
       }
       case 'PINCH_MOVE': {
-        if (this.dualActive || !this.activePinches.has(event.hand) || this.blockedPinches.has(event.hand)) break
+        const action = routePinchEvent(
+          'move', event.hand, this.dualActive, this.activePinches, this.blockedPinches,
+        )
+        if (action === 'ignore') break
         this.mapPoint(event.position)
         this.pinchTrails.move(event.hand, this.mappedPoint.x, this.mappedPoint.y, nowMs)
         break
       }
       case 'PINCH_END':
-        this.activePinches.delete(event.hand)
-        this.blockedPinches.delete(event.hand)
+        routePinchEvent('end', event.hand, this.dualActive, this.activePinches, this.blockedPinches)
         this.pinchTrails.end(event.hand, nowMs)
         break
     }

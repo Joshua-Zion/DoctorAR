@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { AudioManager } from './audio/AudioManager'
+import { AudioManager, type AudioStatus } from './audio/AudioManager'
 import { CameraView } from './components/CameraView'
 import { ControlPanel } from './components/ControlPanel'
 import { DebugCanvas } from './components/DebugCanvas'
@@ -20,6 +20,7 @@ function App() {
   const [cameraRequested, setCameraRequested] = useState(false)
   const [effectError, setEffectError] = useState('')
   const [runtimeNotice, setRuntimeNotice] = useState('')
+  const [audioStatus, setAudioStatus] = useState<AudioStatus>('disabled')
   const stageRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const frameRef = useRef<HandFrame | null>(null)
@@ -66,6 +67,8 @@ function App() {
     }
   }, [audioManager, eventBus])
 
+  useEffect(() => audioManager.subscribeStatus(setAudioStatus), [audioManager])
+
   useEffect(() => {
     audioManager.setEnabled(settings.soundEnabled)
   }, [audioManager, settings.soundEnabled])
@@ -73,6 +76,25 @@ function App() {
   useEffect(() => {
     audioManager.setVolume(settings.soundVolume)
   }, [audioManager, settings.soundVolume])
+
+  useEffect(() => {
+    if (!settings.soundEnabled) return
+
+    const retryAudio = (): void => {
+      const previousStatus = audioManager.getStatus()
+      if (previousStatus !== 'blocked' && previousStatus !== 'suspended') return
+      void audioManager.resumeFromUserGesture().then((resumed) => {
+        if (resumed) setRuntimeNotice('音效已恢复。')
+      })
+    }
+
+    window.addEventListener('pointerdown', retryAudio, { capture: true })
+    window.addEventListener('keydown', retryAudio, { capture: true })
+    return () => {
+      window.removeEventListener('pointerdown', retryAudio, { capture: true })
+      window.removeEventListener('keydown', retryAudio, { capture: true })
+    }
+  }, [audioManager, settings.soundEnabled])
 
   useEffect(() => {
     if (tracking.status === 'ready') return
@@ -87,7 +109,25 @@ function App() {
   }, [runtimeNotice])
 
   const updateSetting = useCallback(<Key extends keyof AppSettings,>(key: Key, value: AppSettings[Key]): void => {
-    if (key === 'soundEnabled') audioManager.setEnabled(Boolean(value))
+    if (key === 'soundEnabled') {
+      const enabled = Boolean(value)
+      if (enabled) {
+        const unlocking = audioManager.enableFromUserGesture()
+        void unlocking.then((unlocked) => {
+          if (audioManager.getStatus() === 'disabled') return
+          if (unlocked) {
+            setRuntimeNotice('音效已开启；听到提示音即表示浏览器解锁成功。')
+          } else {
+            setRuntimeNotice(audioManager.getStatus() === 'unsupported'
+              ? '当前浏览器不支持 Web Audio。'
+              : '浏览器暂未允许播放声音，请再点击页面一次。')
+          }
+        })
+      } else {
+        audioManager.setEnabled(false)
+        setRuntimeNotice('音效已关闭。')
+      }
+    }
     setSettings((current) => ({ ...current, [key]: value }))
   }, [audioManager])
 
@@ -137,6 +177,7 @@ function App() {
               devices={camera.devices}
               actualResolution={camera.actualResolution}
               cameraReady={cameraReady}
+              audioStatus={audioStatus}
               onChange={updateSetting}
               onFullscreen={toggleFullscreen}
             />

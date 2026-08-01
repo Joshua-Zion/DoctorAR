@@ -47,14 +47,14 @@ const MAX_SEGMENTS = Math.max(
   PERFORMANCE_PRESETS.balanced.trailSegmentLimit,
   PERFORMANCE_PRESETS.high.trailSegmentLimit,
 )
-const MAX_SEGMENTS_PER_MOVE = 12
-const HEAD_FADE_MS = 190
-const MOVE_TIMEOUT_MS = 180
+const MAX_SEGMENTS_PER_MOVE = 16
+const HEAD_FADE_MS = 240
+const MOVE_TIMEOUT_MS = 220
 
 const VISUAL_PROFILES: Record<PerformanceMode, Omit<TrailPerformanceProfile, 'segmentLimit' | 'spacing'>> = {
-  low: { lifetimeSeconds: 0.58, width: 5, pointSize: 16 },
-  balanced: { lifetimeSeconds: 0.72, width: 6.5, pointSize: 19 },
-  high: { lifetimeSeconds: 0.84, width: 8, pointSize: 22 },
+  low: { lifetimeSeconds: 0.72, width: 6, pointSize: 19 },
+  balanced: { lifetimeSeconds: 0.9, width: 8.25, pointSize: 24 },
+  high: { lifetimeSeconds: 1.04, width: 10, pointSize: 28 },
 }
 
 const getProfile = (mode: PerformanceMode): TrailPerformanceProfile => ({
@@ -276,7 +276,7 @@ export class PinchTrailEffect {
     state.lastSampleY = y
     state.lastMoveAt = nowMs
     state.fadeStartedAt = 0
-    state.opacity = Math.max(0.08, state.opacity)
+    state.opacity = Math.max(0.32, state.opacity)
   }
 
   move(hand: Handedness, x: number, y: number, nowMs: number): void {

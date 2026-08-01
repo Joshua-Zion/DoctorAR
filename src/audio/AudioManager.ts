@@ -3,6 +3,11 @@ import type { Handedness, Vector3Like } from '../types/hand'
 
 type OneShotKind = 'appear' | 'burst' | 'shockwave'
 
+export type AudioStatus = 'disabled' | 'unlocking' | 'ready' | 'suspended' | 'blocked' | 'unsupported'
+
+type AudioStatusListener = (status: AudioStatus) => void
+type AudioContextFactory = () => AudioContext
+
 interface SynthVoice {
   gain: GainNode
   oscillators: OscillatorNode[]
@@ -26,18 +31,25 @@ interface PinchVoice extends SynthVoice {
 
 const HANDEDNESSES: readonly Handedness[] = ['left', 'right']
 const MIN_GAIN = 0.0001
+const MASTER_GAIN_MULTIPLIER = 1.8
 const ENERGY_UPDATE_INTERVAL_MS = 48
 const PINCH_UPDATE_INTERVAL_MS = 34
+const AUDIO_UNLOCK_TIMEOUT_MS = 1600
 
 const clamp = (value: number, minimum: number, maximum: number): number =>
   Math.max(minimum, Math.min(maximum, value))
 
 /** Original oscillator-only feedback. No recorded samples or external audio assets are used. */
 export class AudioManager {
+  private readonly createContext: AudioContextFactory
   private context: AudioContext | null = null
   private master: GainNode | null = null
+  private compressor: DynamicsCompressorNode | null = null
   private enabled = false
+  private unlockEpoch = 0
   private volume = 0.2
+  private status: AudioStatus = 'disabled'
+  private readonly statusListeners = new Set<AudioStatusListener>()
   private energyVoice: EnergyVoice | null = null
   private energyStartPending = false
   private energyEpoch = 0
@@ -53,26 +65,66 @@ export class AudioManager {
   private readonly lastPlayed = new Map<OneShotKind, number>()
   private readonly oneShots = new Set<SynthVoice>()
 
+  constructor(contextFactory: AudioContextFactory = () => new AudioContext()) {
+    this.createContext = contextFactory
+  }
+
+  getStatus(): AudioStatus {
+    return this.status
+  }
+
+  subscribeStatus(listener: AudioStatusListener): () => void {
+    this.statusListeners.add(listener)
+    listener(this.status)
+    return () => {
+      this.statusListeners.delete(listener)
+    }
+  }
+
   setEnabled(enabled: boolean): void {
     if (this.enabled === enabled) return
     this.enabled = enabled
     if (!enabled) {
+      this.unlockEpoch += 1
       this.resetGestureState()
       this.fadeAll(0.045)
+      this.setStatus('disabled')
       return
     }
 
-    void this.ensureContext().then((context) => {
-      if (!context || !this.master || !this.enabled) return
-      this.master.gain.cancelScheduledValues(context.currentTime)
-      this.master.gain.setTargetAtTime(this.volume, context.currentTime, 0.025)
-    })
+    if (this.context?.state === 'running') {
+      this.restoreMasterGain(this.context)
+      this.setStatus('ready')
+    } else {
+      this.setStatus('suspended')
+    }
+  }
+
+  /** Must be called directly from a click, pointer, or keyboard handler. */
+  async enableFromUserGesture(): Promise<boolean> {
+    this.setEnabled(true)
+    const context = await this.unlockContext()
+    if (!context || !this.enabled) return false
+    this.restoreMasterGain(context)
+    this.playConfirmation(context)
+    return true
+  }
+
+  /** Retries a browser-suspended context on the next real user interaction. */
+  async resumeFromUserGesture(): Promise<boolean> {
+    if (!this.enabled) return false
+    if (this.context?.state === 'running') return true
+    const context = await this.unlockContext()
+    if (!context || !this.enabled) return false
+    this.restoreMasterGain(context)
+    this.playConfirmation(context)
+    return true
   }
 
   setVolume(volume: number): void {
     this.volume = clamp(volume, 0, 1)
     if (this.master && this.context && this.context.state !== 'closed') {
-      this.master.gain.setTargetAtTime(this.enabled ? this.volume : MIN_GAIN, this.context.currentTime, 0.04)
+      this.master.gain.setTargetAtTime(this.enabled ? this.outputGain() : MIN_GAIN, this.context.currentTime, 0.04)
     }
   }
 
@@ -143,51 +195,178 @@ export class AudioManager {
 
   dispose(): void {
     this.enabled = false
+    this.unlockEpoch += 1
     this.resetGestureState()
     this.fadeAll(0.02)
+    this.setStatus('disabled')
 
     const context = this.context
     const master = this.master
+    const compressor = this.compressor
+    context?.removeEventListener('statechange', this.handleContextStateChange)
     this.context = null
     this.master = null
+    this.compressor = null
     this.lastPlayed.clear()
 
     if (!context || context.state === 'closed') return
     master?.gain.setTargetAtTime(MIN_GAIN, context.currentTime, 0.006)
-    window.setTimeout(() => {
+    globalThis.setTimeout(() => {
+      master?.disconnect()
+      compressor?.disconnect()
       if (context.state !== 'closed') void context.close()
     }, 32)
   }
 
-  private async ensureContext(): Promise<AudioContext | null> {
+  private async unlockContext(): Promise<AudioContext | null> {
     if (!this.enabled) return null
+    const epoch = ++this.unlockEpoch
+    this.setStatus('unlocking')
+
     if (!this.context || this.context.state === 'closed') {
-      const context = new AudioContext()
-      const master = context.createGain()
-      master.gain.value = this.volume
-      master.connect(context.destination)
-      this.context = context
-      this.master = master
+      try {
+        const context = this.createContext()
+        const master = context.createGain()
+        const compressor = context.createDynamicsCompressor()
+        master.gain.value = this.outputGain()
+        compressor.threshold.value = -22
+        compressor.knee.value = 18
+        compressor.ratio.value = 5
+        compressor.attack.value = 0.004
+        compressor.release.value = 0.22
+        master.connect(compressor)
+        compressor.connect(context.destination)
+        context.addEventListener('statechange', this.handleContextStateChange)
+        this.context = context
+        this.master = master
+        this.compressor = compressor
+      } catch {
+        if (this.enabled) this.setStatus('unsupported')
+        return null
+      }
     }
 
     const context = this.context
-    try {
-      if (context.state === 'suspended') await context.resume()
-    } catch {
+    if (!context) {
+      if (this.enabled) this.setStatus('unsupported')
       return null
     }
-    return this.enabled && this.context === context && context.state !== 'closed' ? context : null
+    try {
+      if (context.state !== 'running') {
+        const resumed = await this.resumeWithTimeout(context)
+        if (!resumed) {
+          if (this.enabled && this.context === context && this.unlockEpoch === epoch) this.setStatus('blocked')
+          return null
+        }
+      }
+    } catch {
+      if (this.enabled && this.context === context && this.unlockEpoch === epoch) this.setStatus('blocked')
+      return null
+    }
+
+    if (!this.enabled || this.context !== context || this.unlockEpoch !== epoch) return null
+    if (context.state !== 'running') {
+      this.setStatus('blocked')
+      return null
+    }
+
+    this.setStatus('ready')
+    return context
+  }
+
+  private resumeWithTimeout(context: AudioContext): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (value: boolean): void => {
+        if (settled) return
+        settled = true
+        globalThis.clearTimeout(timeout)
+        resolve(value)
+      }
+      const timeout = globalThis.setTimeout(() => finish(false), AUDIO_UNLOCK_TIMEOUT_MS)
+      void context.resume().then(() => finish(true), () => finish(false))
+    })
+  }
+
+  private ensureContext(): Promise<AudioContext | null> {
+    if (!this.enabled) return Promise.resolve(null)
+    const context = this.context
+    if (context?.state === 'running') return Promise.resolve(context)
+    if (context && context.state !== 'closed') this.setStatus('suspended')
+    return Promise.resolve(null)
+  }
+
+  private outputGain(): number {
+    return clamp(this.volume * MASTER_GAIN_MULTIPLIER, MIN_GAIN, 1)
+  }
+
+  private restoreMasterGain(context: AudioContext): void {
+    const master = this.master
+    if (!master || this.context !== context || context.state !== 'running') return
+    master.gain.cancelScheduledValues(context.currentTime)
+    master.gain.setTargetAtTime(this.outputGain(), context.currentTime, 0.025)
+  }
+
+  private setStatus(status: AudioStatus): void {
+    if (this.status === status) return
+    this.status = status
+    for (const listener of [...this.statusListeners]) listener(status)
+  }
+
+  private readonly handleContextStateChange = (): void => {
+    const context = this.context
+    if (!this.enabled) {
+      this.setStatus('disabled')
+      return
+    }
+    if (!context || context.state === 'closed') {
+      this.setStatus('blocked')
+      return
+    }
+    this.setStatus(context.state === 'running' ? 'ready' : 'suspended')
+  }
+
+  private playConfirmation(context: AudioContext): void {
+    const master = this.master
+    if (!master || context.state !== 'running') return
+    const now = context.currentTime
+    const oscillator = context.createOscillator()
+    const gain = context.createGain()
+    oscillator.type = 'sine'
+    oscillator.frequency.setValueAtTime(660, now)
+    oscillator.frequency.exponentialRampToValueAtTime(880, now + 0.14)
+    gain.gain.setValueAtTime(MIN_GAIN, now)
+    gain.gain.exponentialRampToValueAtTime(0.16, now + 0.018)
+    gain.gain.exponentialRampToValueAtTime(MIN_GAIN, now + 0.17)
+    oscillator.connect(gain)
+    gain.connect(master)
+
+    const voice: SynthVoice = {
+      gain,
+      oscillators: [oscillator],
+      nodes: [oscillator, gain],
+      stopping: false,
+      cleanupTimer: null,
+    }
+    this.oneShots.add(voice)
+    oscillator.addEventListener('ended', () => this.cleanupVoice(voice), { once: true })
+    oscillator.start(now)
+    oscillator.stop(now + 0.19)
   }
 
   private playOneShot(kind: OneShotKind, intensity = 1): void {
     const nowMs = performance.now()
     const cooldown = kind === 'appear' ? 240 : kind === 'burst' ? 320 : 620
-    if (nowMs - (this.lastPlayed.get(kind) ?? 0) < cooldown) return
-    this.lastPlayed.set(kind, nowMs)
+    const lastPlayed = this.lastPlayed.get(kind)
+    if (lastPlayed !== undefined && nowMs - lastPlayed < cooldown) return
 
     void this.ensureContext().then((context) => {
       const master = this.master
       if (!context || !master || !this.enabled) return
+      const startedAt = performance.now()
+      const latestPlayed = this.lastPlayed.get(kind)
+      if (latestPlayed !== undefined && startedAt - latestPlayed < cooldown) return
+      this.lastPlayed.set(kind, startedAt)
 
       const now = context.currentTime
       const gain = context.createGain()
@@ -196,24 +375,24 @@ export class AudioManager {
       const secondary = context.createOscillator()
       const normalizedIntensity = clamp(intensity, 0.45, 1.65)
       const duration = kind === 'appear' ? 0.34 : kind === 'burst' ? 0.3 : 0.78
-      const peak = (kind === 'appear' ? 0.042 : kind === 'burst' ? 0.105 : 0.13) * normalizedIntensity
+      const peak = (kind === 'appear' ? 0.09 : kind === 'burst' ? 0.22 : 0.26) * normalizedIntensity
 
       filter.type = kind === 'shockwave' ? 'lowpass' : 'bandpass'
       filter.Q.value = kind === 'appear' ? 5.2 : kind === 'burst' ? 1.1 : 0.72
       primary.type = kind === 'appear' ? 'sine' : 'sawtooth'
       secondary.type = kind === 'burst' ? 'square' : 'sine'
 
-      const primaryStart = kind === 'appear' ? 230 : kind === 'burst' ? 105 : 280
-      const primaryEnd = kind === 'appear' ? 690 : kind === 'burst' ? 38 : 42
-      const secondaryStart = kind === 'appear' ? 345 : kind === 'burst' ? 68 : 98
-      const secondaryEnd = kind === 'appear' ? 1035 : kind === 'burst' ? 31 : 28
+      const primaryStart = kind === 'appear' ? 330 : kind === 'burst' ? 520 : 420
+      const primaryEnd = kind === 'appear' ? 840 : kind === 'burst' ? 110 : 52
+      const secondaryStart = kind === 'appear' ? 495 : kind === 'burst' ? 880 : 720
+      const secondaryEnd = kind === 'appear' ? 1260 : kind === 'burst' ? 180 : 90
       primary.frequency.setValueAtTime(primaryStart, now)
       primary.frequency.exponentialRampToValueAtTime(primaryEnd, now + duration)
       secondary.frequency.setValueAtTime(secondaryStart, now)
       secondary.frequency.exponentialRampToValueAtTime(secondaryEnd, now + duration)
       secondary.detune.value = kind === 'appear' ? 7 : -9
-      filter.frequency.setValueAtTime(kind === 'appear' ? 760 : kind === 'burst' ? 430 : 1250, now)
-      filter.frequency.exponentialRampToValueAtTime(kind === 'appear' ? 1450 : kind === 'burst' ? 120 : 135, now + duration)
+      filter.frequency.setValueAtTime(kind === 'appear' ? 1100 : kind === 'burst' ? 1500 : 1800, now)
+      filter.frequency.exponentialRampToValueAtTime(kind === 'appear' ? 1900 : kind === 'burst' ? 320 : 180, now + duration)
 
       gain.gain.setValueAtTime(MIN_GAIN, now)
       gain.gain.exponentialRampToValueAtTime(Math.max(MIN_GAIN, peak), now + (kind === 'shockwave' ? 0.035 : 0.018))
@@ -268,7 +447,7 @@ export class AudioManager {
       filter.frequency.value = 620
       filter.Q.value = 2.4
       gain.gain.setValueAtTime(MIN_GAIN, now)
-      gain.gain.exponentialRampToValueAtTime(0.027, now + 0.16)
+      gain.gain.exponentialRampToValueAtTime(0.06, now + 0.16)
       low.connect(filter)
       high.connect(filter)
       filter.connect(gain)
@@ -304,8 +483,8 @@ export class AudioManager {
 
     const width = clamp(pose.width, 0.035, 0.34)
     const positionTone = clamp(1 - pose.position.y, 0, 1)
-    const base = 78 + width * 155 + positionTone * 22
-    const energyGain = clamp(0.018 + pose.confidence * 0.012 + width * 0.025, 0.018, 0.045)
+    const base = 128 + width * 220 + positionTone * 54
+    const energyGain = clamp(0.045 + pose.confidence * 0.026 + width * 0.04, 0.045, 0.09)
     const now = context.currentTime
     voice.low.frequency.setTargetAtTime(base, now, 0.045)
     voice.high.frequency.setTargetAtTime(base * 2.01, now, 0.045)
@@ -324,12 +503,12 @@ export class AudioManager {
 
     const distance = clamp(this.chargeDistance, 0.1, 0.72)
     const motion = clamp(Math.abs(this.chargeVelocity), 0, 1.8)
-    const base = 82 + distance * 185 + motion * 24
+    const base = 126 + distance * 240 + motion * 42
     const now = context.currentTime
     voice.low.frequency.setTargetAtTime(base, now, 0.035)
     voice.high.frequency.setTargetAtTime(base * 2.02, now, 0.035)
     voice.filter.frequency.setTargetAtTime(650 + distance * 980 + motion * 180, now, 0.045)
-    voice.gain.gain.setTargetAtTime(clamp(0.03 + distance * 0.025 + motion * 0.012, 0.03, 0.068), now, 0.04)
+    voice.gain.gain.setTargetAtTime(clamp(0.06 + distance * 0.05 + motion * 0.024, 0.06, 0.14), now, 0.04)
   }
 
   private updateEnergyFromState(force = false): void {
@@ -341,10 +520,10 @@ export class AudioManager {
     const context = this.context
     if (!voice || !context) return
     const now = context.currentTime
-    voice.low.frequency.setTargetAtTime(96, now, 0.06)
-    voice.high.frequency.setTargetAtTime(193, now, 0.06)
-    voice.filter.frequency.setTargetAtTime(620, now, 0.08)
-    voice.gain.gain.setTargetAtTime(0.026, now, 0.07)
+    voice.low.frequency.setTargetAtTime(138, now, 0.06)
+    voice.high.frequency.setTargetAtTime(278, now, 0.06)
+    voice.filter.frequency.setTargetAtTime(820, now, 0.08)
+    voice.gain.gain.setTargetAtTime(0.062, now, 0.07)
   }
 
   private stopEnergyWhenIdle(): void {
@@ -379,10 +558,10 @@ export class AudioManager {
       shimmer.frequency.value = 1247
       shimmer.detune.value = hand === 'left' ? -8 : 8
       filter.type = 'bandpass'
-      filter.Q.value = 7.5
+      filter.Q.value = 5.5
       filter.frequency.value = 980
       gain.gain.setValueAtTime(MIN_GAIN, now)
-      gain.gain.exponentialRampToValueAtTime(0.026, now + 0.055)
+      gain.gain.exponentialRampToValueAtTime(0.07, now + 0.055)
       carrier.connect(filter)
       shimmer.connect(filter)
       filter.connect(panner)
@@ -409,7 +588,10 @@ export class AudioManager {
 
   private updatePinch(hand: Handedness, position: Vector3Like): void {
     const voice = this.pinchVoices[hand]
-    if (!voice) return
+    if (!voice) {
+      if (this.enabled && this.status === 'ready') this.startPinch(hand, position)
+      return
+    }
     this.applyPinchPosition(voice, hand, position)
   }
 
@@ -428,7 +610,7 @@ export class AudioManager {
     voice.shimmer.frequency.setTargetAtTime(Math.max(160, frequency * 2.015), now, 0.024)
     voice.filter.frequency.setTargetAtTime(clamp(frequency * 1.48, 520, 2300), now, 0.028)
     voice.panner.pan.setTargetAtTime(clamp((x - 0.5) * 1.7, -0.9, 0.9), now, 0.03)
-    voice.gain.gain.setTargetAtTime(0.021 + (1 - y) * 0.012, now, 0.035)
+    voice.gain.gain.setTargetAtTime(0.055 + (1 - y) * 0.035, now, 0.035)
   }
 
   private stopPinch(hand: Handedness, fadeSeconds = 0.075): void {
@@ -476,11 +658,11 @@ export class AudioManager {
         // An oscillator that reached its natural stop is already being cleaned up.
       }
     }
-    voice.cleanupTimer = window.setTimeout(() => this.cleanupVoice(voice), Math.ceil((fadeSeconds + 0.06) * 1000))
+    voice.cleanupTimer = globalThis.setTimeout(() => this.cleanupVoice(voice), Math.ceil((fadeSeconds + 0.06) * 1000))
   }
 
   private cleanupVoice(voice: SynthVoice): void {
-    if (voice.cleanupTimer !== null) window.clearTimeout(voice.cleanupTimer)
+    if (voice.cleanupTimer !== null) globalThis.clearTimeout(voice.cleanupTimer)
     voice.cleanupTimer = null
     this.oneShots.delete(voice)
     if (this.energyVoice === voice) this.energyVoice = null

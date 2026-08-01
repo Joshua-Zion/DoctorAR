@@ -4,6 +4,7 @@ import type { HandFrame, Handedness, TrackedHand } from '../types/hand'
 import { saturate } from '../utils/math'
 import { midpoint3 } from '../utils/vector'
 import { GestureEventBus } from './GestureEventBus'
+import { getHandExtensionScore } from './GestureRecognizer'
 import { GestureStateMachine, type GestureStateUpdate } from './GestureStateMachine'
 import { TwoHandReleaseDetector } from './TwoHandReleaseDetector'
 
@@ -75,19 +76,23 @@ export class GestureCoordinator {
         confidence,
         present,
         sensitivity,
-        cooldownMs,
       })
-      const fistUpdate = machines.fist.update({
+      const pinchScore = hand?.scores.pinch ?? 0
+      const fistScore = hand?.scores.fist ?? 0
+      const pinchOwnsPose = pinchScore >= Math.max(0.52, fistScore - 0.08)
+      const pinchUpdate = machines.pinch.update({
         timestamp: frame.timestamp,
-        score: hand?.scores.fist ?? 0,
+        score: pinchOwnsPose ? pinchScore : 0,
         confidence,
         present,
         sensitivity,
-        cooldownMs,
       })
-      const pinchUpdate = machines.pinch.update({
+      const pinchClaimsHand = (
+        pinchUpdate.phase === 'candidate' || pinchUpdate.phase === 'active'
+      )
+      const fistUpdate = machines.fist.update({
         timestamp: frame.timestamp,
-        score: hand?.scores.pinch ?? 0,
+        score: pinchClaimsHand ? 0 : hand?.scores.fist ?? 0,
         confidence,
         present,
         sensitivity,
@@ -150,11 +155,15 @@ export class GestureCoordinator {
     if (open.released) this.eventBus.emit({ type: 'PALM_CLOSE', hand: hand.handedness })
 
     if (fist.activated) {
+      const intensity = Math.min(1.65, Math.max(
+        1.05,
+        hand.scores.fist * 1.18 + hand.speed * 0.42,
+      ))
       this.eventBus.emit({
         type: 'FIST',
         hand: hand.handedness,
         pose,
-        intensity: saturate(hand.scores.fist + hand.speed * 0.28),
+        intensity,
       })
     }
 
@@ -179,17 +188,19 @@ export class GestureCoordinator {
       frame.timestamp - left.seenAt <= GESTURE_CONFIG.loss.holdMs &&
       frame.timestamp - right.seenAt <= GESTURE_CONFIG.loss.holdMs,
     )
-    const bothDetectedThisFrame = Boolean(
+    const bothFreshForRelease = Boolean(
       left && right &&
-      Math.abs(frame.timestamp - left.seenAt) < 0.5 &&
-      Math.abs(frame.timestamp - right.seenAt) < 0.5,
+      frame.timestamp - left.seenAt <= 60 &&
+      frame.timestamp - right.seenAt <= 60,
     )
-    const bothOpen = left && right ? Math.min(left.scores.open, right.scores.open) : 0
+    const bothExtended = left && right
+      ? Math.min(getHandExtensionScore(left), getHandExtensionScore(right))
+      : 0
     const distanceReady = metric
       ? metric.distance >= GESTURE_CONFIG.twoHand.minDistance && metric.distance <= GESTURE_CONFIG.twoHand.maxDistance
       : false
     const score = metric && distanceReady && metric.ready
-      ? saturate(bothOpen * 0.58 + metric.oppositionScore * 0.42)
+      ? saturate(bothExtended * 0.68 + metric.oppositionScore * 0.32)
       : 0
     const confidence = left && right ? Math.min(left.trackingQuality, right.trackingQuality) : 0
 
@@ -199,7 +210,6 @@ export class GestureCoordinator {
       confidence,
       present: Boolean(metric && bothFresh),
       sensitivity,
-      cooldownMs,
     })
 
     const aspectY = frame.videoHeight / Math.max(1, frame.videoWidth)
@@ -212,13 +222,20 @@ export class GestureCoordinator {
       ? (relativeVelocityX * axisX + relativeVelocityY * axisY) / axisLength
       : 0
 
+    const releaseObservationValid = Boolean(
+      metric &&
+      bothFreshForRelease &&
+      (update.phase === 'active' || metric.ready)
+    )
     const release = this.twoHandRelease.update({
       timestamp: frame.timestamp,
       distance: metric?.distance ?? 0,
       distanceVelocity: metric?.distanceVelocity,
       outwardVelocity,
-      chargeActive: update.phase === 'active',
-      valid: Boolean(metric?.ready && bothDetectedThisFrame),
+      chargeActive: update.phase === 'candidate' || update.phase === 'active',
+      releaseEnabled: update.phase === 'active',
+      valid: releaseObservationValid,
+      resetVelocityOnRecovery: !releaseObservationValid,
     })
 
     if (metric && update.activated) {

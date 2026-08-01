@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import type { AudioStatus } from '../audio/AudioManager'
 import { THEME_LIST } from '../config/effectThemes'
 import { PERFORMANCE_PRESETS, RESOLUTION_OPTIONS } from '../config/performanceConfig'
 import type { AppSettings, PerformanceMode } from '../types/settings'
@@ -8,6 +9,7 @@ interface ControlPanelProps {
   devices: MediaDeviceInfo[]
   actualResolution: string
   cameraReady: boolean
+  audioStatus: AudioStatus
   onChange: <Key extends keyof AppSettings>(key: Key, value: AppSettings[Key]) => void
   onFullscreen: () => void
 }
@@ -29,6 +31,15 @@ const Toggle = ({ label, hint, checked, onChange }: ToggleProps) => (
     <span className="toggle-track" aria-hidden="true"><span /></span>
   </label>
 )
+
+const AUDIO_STATUS_COPY: Record<AudioStatus, string> = {
+  disabled: '音效关闭',
+  unlocking: '正在解锁浏览器音频…',
+  ready: '音频已解锁 · 手势会发声',
+  suspended: '音频已暂停 · 点击页面恢复',
+  blocked: '浏览器阻止播放 · 再点击页面重试',
+  unsupported: '当前浏览器不支持 Web Audio',
+}
 
 interface RangeProps {
   label: string
@@ -63,6 +74,7 @@ export const ControlPanel = ({
   devices,
   actualResolution,
   cameraReady,
+  audioStatus,
   onChange,
   onFullscreen,
 }: ControlPanelProps) => {
@@ -127,7 +139,16 @@ export const ControlPanel = ({
           <Range label="能量亮度" value={settings.brightness} min={0.4} max={1.6} step={0.01} display={`${Math.round(settings.brightness * 100)}%`} onChange={(value) => onChange('brightness', value)} />
           <Range label="粒子密度" value={settings.particleAmount} min={0.15} max={1} step={0.01} display={`${Math.round(settings.particleAmount * 100)}%`} onChange={(value) => onChange('particleAmount', value)} />
           <Range label="粒子速度" value={settings.particleSpeed} min={0.5} max={1.8} step={0.01} display={`${settings.particleSpeed.toFixed(1)}×`} onChange={(value) => onChange('particleSpeed', value)} />
-          <Toggle label="合成音效" hint="原创 Web Audio 音色" checked={settings.soundEnabled} onChange={(value) => onChange('soundEnabled', value)} />
+          <Toggle label="合成音效" hint="开启后会播放一声确认音" checked={settings.soundEnabled} onChange={(value) => onChange('soundEnabled', value)} />
+          <div
+            className={`audio-status is-${audioStatus}`}
+            data-audio-status={audioStatus}
+            role="status"
+            aria-live="polite"
+          >
+            <i aria-hidden="true" />
+            <span>{AUDIO_STATUS_COPY[audioStatus]}</span>
+          </div>
           <Range label="音效音量" value={settings.soundVolume} min={0.05} max={0.6} step={0.01} display={`${Math.round(settings.soundVolume * 100)}%`} onChange={(value) => onChange('soundVolume', value)} />
         </section>
 

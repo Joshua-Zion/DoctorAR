@@ -12,6 +12,14 @@ interface EffectStageProps {
   onError: (message: string) => void
 }
 
+interface SmokeEffectStats {
+  maxParticles: number
+  maxTrailSegments: number
+  maxShockwaves: number
+}
+
+type SmokeWindow = Window & { __DOCTORAR_SMOKE_EFFECT_STATS__?: SmokeEffectStats }
+
 export const EffectStage = ({ eventBus, settings, videoRef, metricsRef, onError }: EffectStageProps) => {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const managerRef = useRef<EffectManager | null>(null)
@@ -21,6 +29,11 @@ export const EffectStage = ({ eventBus, settings, videoRef, metricsRef, onError 
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
+    const smokeWindow = window as SmokeWindow
+    const smokeStats = new URLSearchParams(window.location.search).has('doctorar-smoke')
+      ? { maxParticles: 0, maxTrailSegments: 0, maxShockwaves: 0 }
+      : null
+    if (smokeStats) smokeWindow.__DOCTORAR_SMOKE_EFFECT_STATS__ = smokeStats
 
     let cancelled = false
     void import('../effects/EffectManager').then(({ EffectManager: EffectManagerClass }) => {
@@ -32,6 +45,11 @@ export const EffectStage = ({ eventBus, settings, videoRef, metricsRef, onError 
         metrics.activeTrailSegments = stats.activeTrailSegments
         metrics.activeShockwaves = stats.activeShockwaves
         metrics.drawCalls = stats.drawCalls
+        if (smokeStats) {
+          smokeStats.maxParticles = Math.max(smokeStats.maxParticles, stats.activeParticles)
+          smokeStats.maxTrailSegments = Math.max(smokeStats.maxTrailSegments, stats.activeTrailSegments)
+          smokeStats.maxShockwaves = Math.max(smokeStats.maxShockwaves, stats.activeShockwaves)
+        }
       })
       if (cancelled) {
         manager.dispose()
@@ -60,6 +78,9 @@ export const EffectStage = ({ eventBus, settings, videoRef, metricsRef, onError 
       cancelled = true
       managerRef.current?.dispose()
       managerRef.current = null
+      if (smokeWindow.__DOCTORAR_SMOKE_EFFECT_STATS__ === smokeStats) {
+        delete smokeWindow.__DOCTORAR_SMOKE_EFFECT_STATS__
+      }
     }
   }, [eventBus, metricsRef, onError, videoRef])
 

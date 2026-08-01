@@ -31,18 +31,18 @@ export interface TwoHandReleaseConfig {
 
 export const DEFAULT_TWO_HAND_RELEASE_CONFIG: Readonly<TwoHandReleaseConfig> = {
   capacity: 48,
-  historyWindowMs: 360,
-  nearDistance: 0.24,
-  minCompressionDelta: 0.035,
-  armHoldMs: 120,
-  expansionStartDelta: 0.015,
-  releaseWindowMs: 260,
-  minExpansionDelta: 0.07,
-  releaseVelocity: 0.82,
-  velocityHalfLifeMs: 55,
+  historyWindowMs: 420,
+  nearDistance: 0.28,
+  minCompressionDelta: 0.025,
+  armHoldMs: 70,
+  expansionStartDelta: 0.012,
+  releaseWindowMs: 360,
+  minExpansionDelta: 0.055,
+  releaseVelocity: 0.5,
+  velocityHalfLifeMs: 45,
   maxAbsVelocity: 4,
   cooldownMs: 260,
-  invalidResetMs: 160,
+  invalidResetMs: 240,
 }
 
 export interface TwoHandReleaseSample {
@@ -54,10 +54,14 @@ export interface TwoHandReleaseSample {
   distanceVelocity?: number
   /** Optional relative velocity projected along the hand-to-hand axis. */
   outwardVelocity?: number
-  /** True only while the two-hand charge gesture is active. */
+  /** True while the two-hand charge gesture is a candidate or active. */
   chargeActive: boolean
+  /** True only after the charge state is active and a release may be emitted. */
+  releaseEnabled?: boolean
   /** False for stale, held, or otherwise unreliable two-hand observations. */
   valid?: boolean
+  /** Invalid samples with a likely pose/reacquisition jump reset velocity on recovery. */
+  resetVelocityOnRecovery?: boolean
 }
 
 export interface TwoHandReleaseUpdate {
@@ -78,6 +82,8 @@ interface HistorySample {
 
 const finiteOr = (value: number | undefined, fallback: number): number =>
   Number.isFinite(value) ? value as number : fallback
+
+const RELEASE_QUALIFIED_HOLD_MS = 140
 
 const clamp = (value: number, minimum: number, maximum: number): number =>
   Math.min(maximum, Math.max(minimum, value))
@@ -116,12 +122,16 @@ export class TwoHandReleaseDetector {
   private phaseValue: TwoHandReleasePhase = 'idle'
   private lastTimestamp = Number.NEGATIVE_INFINITY
   private lastValidTimestamp = Number.NEGATIVE_INFINITY
+  private lastChargeTimestamp = Number.NEGATIVE_INFINITY
   private lastDistance = 0
   private filteredVelocity = 0
   private armCandidateSince = Number.NaN
   private armCandidateMinimum = Number.POSITIVE_INFINITY
   private armedMinimum = Number.POSITIVE_INFINITY
   private expansionStartedAt = Number.NaN
+  private releaseQualified = false
+  private releaseQualifiedAt = Number.NaN
+  private reacquisitionPending = false
   private cooldownUntil = Number.NEGATIVE_INFINITY
 
   constructor(config: Partial<TwoHandReleaseConfig> = {}) {
@@ -151,10 +161,11 @@ export class TwoHandReleaseDetector {
       this.resetSequence('idle')
     }
 
-    const valid = (sample.valid ?? true) && sample.chargeActive
-    if (!valid) {
+    const observationValid = sample.valid ?? true
+    if (!observationValid) {
+      if (sample.resetVelocityOnRecovery) this.reacquisitionPending = true
       if (this.phaseValue === 'cooldown') return this.result(false, false, false, timestamp)
-      const invalidForMs = timestamp - this.lastValidTimestamp
+      const invalidForMs = timestamp - this.lastChargeTimestamp
       if (invalidForMs > this.config.invalidResetMs && this.phaseValue !== 'idle') {
         this.resetSequence('idle')
         return this.result(false, false, true, timestamp)
@@ -163,15 +174,34 @@ export class TwoHandReleaseDetector {
     }
 
     const elapsedMs = Number.isFinite(this.lastValidTimestamp) ? timestamp - this.lastValidTimestamp : 0
+    const requiresReacquisitionBaseline =
+      this.reacquisitionPending ||
+      elapsedMs >= this.config.invalidResetMs
+    this.reacquisitionPending = false
+    if (requiresReacquisitionBaseline) {
+      this.lastDistance = sample.distance
+      this.lastValidTimestamp = timestamp
+      this.filteredVelocity = 0
+      this.releaseQualified = false
+      this.releaseQualifiedAt = Number.NaN
+      this.expansionStartedAt = Number.NaN
+      this.pushHistory({ timestamp, distance: sample.distance })
+      if (sample.chargeActive) this.lastChargeTimestamp = timestamp
+      return this.result(false, false, false, timestamp)
+    }
     const derivedVelocity = elapsedMs > 0 ? (sample.distance - this.lastDistance) / (elapsedMs / 1000) : 0
     const suppliedVelocity = finiteOr(sample.distanceVelocity, derivedVelocity)
     const outwardVelocity = finiteOr(sample.outwardVelocity, suppliedVelocity)
-    const conservativeVelocity = Math.min(suppliedVelocity, outwardVelocity)
+    const conservativeVelocity = suppliedVelocity > 0 && outwardVelocity > 0
+      ? suppliedVelocity * 0.65 + outwardVelocity * 0.35
+      : Math.min(suppliedVelocity, outwardVelocity)
     const boundedVelocity = clamp(conservativeVelocity, -this.config.maxAbsVelocity, this.config.maxAbsVelocity)
     const smoothingAlpha = elapsedMs > 0
       ? 1 - Math.exp(-Math.LN2 * elapsedMs / this.config.velocityHalfLifeMs)
       : 1
     this.filteredVelocity += (boundedVelocity - this.filteredVelocity) * smoothingAlpha
+    const recentPeak = this.recentPeakDistance(timestamp)
+    this.pushHistory({ timestamp, distance: sample.distance })
     this.lastDistance = sample.distance
     this.lastValidTimestamp = timestamp
 
@@ -179,8 +209,17 @@ export class TwoHandReleaseDetector {
       return this.result(false, false, false, timestamp)
     }
 
-    const recentPeak = this.recentPeakDistance(timestamp)
-    this.pushHistory({ timestamp, distance: sample.distance })
+    if (!sample.chargeActive) {
+      const inactiveForMs = timestamp - this.lastChargeTimestamp
+      if (inactiveForMs > this.config.invalidResetMs && this.phaseValue !== 'idle') {
+        this.resetSequence('idle')
+        return this.result(false, false, true, timestamp)
+      }
+      return this.result(false, false, false, timestamp)
+    }
+
+    this.lastChargeTimestamp = timestamp
+    const releaseEnabled = sample.releaseEnabled ?? sample.chargeActive
 
     if (this.phaseValue === 'idle' || this.phaseValue === 'arming') {
       const compression = Math.max(0, recentPeak - sample.distance)
@@ -205,6 +244,8 @@ export class TwoHandReleaseDetector {
         this.phaseValue = 'armed'
         this.armedMinimum = Math.min(this.armCandidateMinimum, sample.distance)
         this.expansionStartedAt = Number.NaN
+        this.releaseQualified = false
+        this.releaseQualifiedAt = Number.NaN
         this.clearArmCandidate()
         return this.result(false, true, false, timestamp)
       }
@@ -212,7 +253,7 @@ export class TwoHandReleaseDetector {
       return this.result(false, false, false, timestamp)
     }
 
-    return this.updateArmed(sample.distance, timestamp)
+    return this.updateArmed(sample.distance, timestamp, releaseEnabled)
   }
 
   reset(): void {
@@ -222,18 +263,24 @@ export class TwoHandReleaseDetector {
     this.phaseValue = 'idle'
     this.lastTimestamp = Number.NEGATIVE_INFINITY
     this.lastValidTimestamp = Number.NEGATIVE_INFINITY
+    this.lastChargeTimestamp = Number.NEGATIVE_INFINITY
     this.lastDistance = 0
     this.filteredVelocity = 0
     this.clearArmCandidate()
     this.armedMinimum = Number.POSITIVE_INFINITY
     this.expansionStartedAt = Number.NaN
+    this.releaseQualified = false
+    this.releaseQualifiedAt = Number.NaN
+    this.reacquisitionPending = false
     this.cooldownUntil = Number.NEGATIVE_INFINITY
   }
 
-  private updateArmed(distance: number, timestamp: number): TwoHandReleaseUpdate {
+  private updateArmed(distance: number, timestamp: number, releaseEnabled: boolean): TwoHandReleaseUpdate {
     if (distance < this.armedMinimum) {
       this.armedMinimum = distance
       this.expansionStartedAt = Number.NaN
+      this.releaseQualified = false
+      this.releaseQualifiedAt = Number.NaN
     }
 
     const expansion = Math.max(0, distance - this.armedMinimum)
@@ -257,10 +304,29 @@ export class TwoHandReleaseDetector {
       expansion >= this.config.minExpansionDelta &&
       this.filteredVelocity >= this.config.releaseVelocity
     ) {
+      this.releaseQualified = true
+      this.releaseQualifiedAt = timestamp
+    }
+
+    if (
+      this.releaseQualified &&
+      timestamp - this.releaseQualifiedAt > RELEASE_QUALIFIED_HOLD_MS
+    ) {
+      this.releaseQualified = false
+      this.releaseQualifiedAt = Number.NaN
+    }
+
+    if (
+      this.releaseQualified &&
+      releaseEnabled &&
+      expansion >= this.config.minExpansionDelta
+    ) {
       this.phaseValue = 'cooldown'
       this.cooldownUntil = timestamp + this.config.cooldownMs
       this.clearArmCandidate()
       this.expansionStartedAt = Number.NaN
+      this.releaseQualified = false
+      this.releaseQualifiedAt = Number.NaN
       return this.result(true, false, false, timestamp, expansion, expansionElapsedMs)
     }
 
@@ -296,7 +362,10 @@ export class TwoHandReleaseDetector {
     this.clearArmCandidate()
     this.armedMinimum = Number.POSITIVE_INFINITY
     this.expansionStartedAt = Number.NaN
+    this.releaseQualified = false
+    this.releaseQualifiedAt = Number.NaN
     if (phase === 'idle') {
+      this.lastChargeTimestamp = Number.NEGATIVE_INFINITY
       this.history.fill(undefined)
       this.historyHead = 0
       this.historyCount = 0
