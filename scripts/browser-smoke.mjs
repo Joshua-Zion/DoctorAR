@@ -4,7 +4,10 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 
-const targetUrl = process.env.DOCTORAR_URL ?? 'http://127.0.0.1:4173'
+const requestedUrl = process.env.DOCTORAR_URL ?? 'http://127.0.0.1:4173'
+const target = new URL(requestedUrl)
+target.searchParams.set('doctorar-smoke', '1')
+const targetUrl = target.href
 const screenshotPath = resolve(process.argv[2] ?? 'doctorar-browser-smoke.png')
 const browserCandidates = [
   process.env.EDGE_PATH,
@@ -96,7 +99,7 @@ const browserProcess = spawn(browserPath, [
   '--use-fake-ui-for-media-stream',
   '--use-fake-device-for-media-stream',
   '--autoplay-policy=no-user-gesture-required',
-  '--use-angle=swiftshader',
+  '--use-angle=swiftshader-webgl',
   '--enable-unsafe-swiftshader',
   '--window-size=1440,900',
   targetUrl,
@@ -176,12 +179,13 @@ try {
     const value = await evaluate(`(() => ({
       ready: document.querySelector('.system-status')?.classList.contains('is-ready') ?? false,
       error: document.querySelector('.error-card p')?.textContent ?? '',
+      viteError: document.querySelector('vite-error-overlay')?.shadowRoot?.textContent ?? '',
       videoWidth: document.querySelector('video')?.videoWidth ?? 0,
       videoHeight: document.querySelector('video')?.videoHeight ?? 0,
       controls: Boolean(document.querySelector('.control-panel')),
       effectCanvas: Boolean(document.querySelector('canvas.effect-layer'))
     }))()`)
-    if (value.error) throw new Error(value.error)
+    if (value.error || value.viteError) throw new Error(value.error || value.viteError)
     return value.ready ? value : null
   }, 35_000, 'camera, MediaPipe model, and WebGL readiness')
 
@@ -190,15 +194,46 @@ try {
     debugLabel?.click()
     document.querySelectorAll('.theme-grid button')[1]?.click()
   })()`)
-  await delay(700)
+  const v11EffectsRendered = await waitForValue(() => evaluate(`(() => {
+    const rows = [...document.querySelectorAll('.debug-grid > div')]
+    const read = (label) => rows.find((row) => row.querySelector('dt')?.textContent === label)?.querySelector('dd')?.textContent ?? ''
+    const backend = read('视觉后端')
+    const inferenceMs = Number.parseFloat(read('推理'))
+    return backend === 'WORKER' && Number.isFinite(inferenceMs) && inferenceMs > 0
+  })()`), 12_000, 'a completed Worker inference')
+  await evaluate(`(() => {
+    const bus = window.__DOCTORAR_GESTURE_BUS__
+    if (!bus) throw new Error('Development gesture test bus is unavailable')
+    const now = performance.now()
+    bus.emit({ type: 'PINCH_START', hand: 'left', position: { x: 0.32, y: 0.56, z: 0 } })
+    for (let index = 1; index <= 12; index += 1) {
+      bus.emit({
+        type: 'PINCH_MOVE',
+        hand: 'left',
+        position: { x: 0.32 + index * 0.022, y: 0.56 - Math.sin(index * 0.48) * 0.11, z: 0 },
+      })
+    }
+    bus.emit({ type: 'TWO_HAND_RELEASE', center: { x: 0.5, y: 0.5, z: 0 }, velocity: 1.8, timestamp: now })
+  })()`)
+  await waitForValue(() => evaluate(`(() => {
+    const rows = [...document.querySelectorAll('.debug-grid > div')]
+    const readNumber = (label) => Number.parseFloat(rows.find((row) => row.querySelector('dt')?.textContent === label)?.querySelector('dd')?.textContent ?? '0')
+    return readNumber('轨迹段') > 0 && readNumber('冲击波') > 0
+  })()`), 3_000, 'V1.1 trail and shockwave rendering')
 
-  const interactions = await evaluate(`(() => ({
+  const interactions = {
+    ...await evaluate(`(() => ({
     debugPanel: Boolean(document.querySelector('.debug-panel')),
     activeTheme: document.querySelector('.theme-grid button.is-active')?.getAttribute('title') ?? '',
+    visionBackend: [...document.querySelectorAll('.debug-grid > div')].find((row) => row.querySelector('dt')?.textContent === '视觉后端')?.querySelector('dd')?.textContent ?? '',
+    trailSegments: Number.parseFloat([...document.querySelectorAll('.debug-grid > div')].find((row) => row.querySelector('dt')?.textContent === '轨迹段')?.querySelector('dd')?.textContent ?? '0'),
+    shockwaves: Number.parseFloat([...document.querySelectorAll('.debug-grid > div')].find((row) => row.querySelector('dt')?.textContent === '冲击波')?.querySelector('dd')?.textContent ?? '0'),
     webglWidth: document.querySelector('canvas.effect-layer')?.width ?? 0,
     debugWidth: document.querySelector('canvas.debug-layer')?.width ?? 0,
     statusText: document.querySelector('.system-status span')?.textContent ?? ''
-  }))()`)
+    }))()`),
+    v11EffectsRendered,
+  }
 
   const screenshot = await session.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
   await writeFile(screenshotPath, Buffer.from(screenshot.data, 'base64'))
@@ -217,10 +252,13 @@ try {
 
   if (!initial.hasBrand || !initial.hasStartButton || !initial.effectDeferred) process.exitCode = 1
   if (!ready.controls || !ready.effectCanvas || ready.videoWidth <= 0 || ready.videoHeight <= 0) process.exitCode = 1
-  if (!interactions.debugPanel || interactions.activeTheme !== '蓝色空间' || interactions.webglWidth <= 0) process.exitCode = 1
+  if (!interactions.debugPanel || interactions.activeTheme !== '蓝色空间' || interactions.visionBackend !== 'WORKER' || !interactions.v11EffectsRendered || interactions.webglWidth <= 0) process.exitCode = 1
   if (exceptions.length || consoleErrors.length || networkFailures.length) process.exitCode = 1
 
   await session.send('Browser.close').catch(() => undefined)
+} catch (error) {
+  process.exitCode = 1
+  console.error(error instanceof Error ? error.stack : error)
 } finally {
   session?.close()
   if (!browserProcess.killed) browserProcess.kill()

@@ -1,13 +1,16 @@
 import * as THREE from 'three'
 import { EFFECT_THEMES } from '../config/effectThemes'
+import { GESTURE_CONFIG } from '../config/gestureConfig'
 import { PERFORMANCE_PRESETS } from '../config/performanceConfig'
 import type { EffectRuntimeSettings, EffectStats } from '../types/effect'
 import type { GestureEvent, GesturePose } from '../types/gesture'
-import type { Vector3Like } from '../types/hand'
+import type { Handedness, Vector3Like } from '../types/hand'
 import { DEFAULT_SETTINGS } from '../types/settings'
 import { clamp } from '../utils/math'
 import { MagicCircleEffect, type MagicCircleTarget } from './MagicCircleEffect'
 import { ParticleSystem } from './ParticleSystem'
+import { PinchTrailEffect } from './PinchTrailEffect'
+import { ShockwaveEffect } from './ShockwaveEffect'
 
 export interface GestureEventSource {
   subscribe(listener: (event: GestureEvent) => void): () => void
@@ -43,10 +46,14 @@ export class EffectManager {
   private readonly scene = new THREE.Scene()
   private readonly camera = new THREE.OrthographicCamera(-0.5, 0.5, 0.5, -0.5, 0.1, 2000)
   private readonly particles: ParticleSystem
+  private readonly pinchTrails: PinchTrailEffect
+  private readonly shockwaves: ShockwaveEffect
   private readonly circles: Record<'left' | 'right' | 'dual', MagicCircleEffect>
   private readonly unsubscribeEvents: () => void
   private readonly onStats?: (stats: EffectStats) => void
   private readonly mappedPoint = { x: 0, y: 0 }
+  private readonly activePinches = new Set<Handedness>()
+  private readonly blockedPinches = new Set<Handedness>()
 
   private resizeObserver: ResizeObserver | null = null
   private settings: EffectRuntimeSettings = { ...DEFAULT_RUNTIME_SETTINGS }
@@ -82,6 +89,8 @@ export class EffectManager {
 
     const initialTheme = EFFECT_THEMES[this.settings.theme]
     this.particles = new ParticleSystem(this.scene, MAX_PARTICLES)
+    this.pinchTrails = new PinchTrailEffect(this.scene, initialTheme)
+    this.shockwaves = new ShockwaveEffect(this.scene, initialTheme)
     this.circles = {
       left: new MagicCircleEffect(this.scene, 'left', initialTheme),
       right: new MagicCircleEffect(this.scene, 'right', initialTheme),
@@ -143,6 +152,19 @@ export class EffectManager {
     this.particles.setEnabled(this.settings.enabled && this.settings.particlesEnabled)
     this.particles.setLimit(preset.particleLimit)
     this.particles.setSpeedScale(this.settings.particleSpeed)
+    this.pinchTrails.configure({
+      enabled: this.settings.enabled,
+      theme,
+      performanceMode: this.settings.performanceMode,
+      brightness: this.settings.brightness,
+      effectScale: this.settings.scale,
+    })
+    this.shockwaves.configure({
+      enabled: this.settings.enabled,
+      theme,
+      performanceMode: this.settings.performanceMode,
+      brightness: this.settings.brightness,
+    })
     this.resize(this.width, this.height)
   }
 
@@ -166,6 +188,8 @@ export class EffectManager {
     this.camera.bottom = -nextHeight / 2
     this.camera.updateProjectionMatrix()
     this.particles.setPixelRatio(nextPixelRatio)
+    this.pinchTrails.resize(nextWidth, nextHeight, nextPixelRatio)
+    this.shockwaves.resize(nextWidth, nextHeight)
   }
 
   start(): void {
@@ -188,6 +212,8 @@ export class EffectManager {
     this.circles.left.dispose()
     this.circles.right.dispose()
     this.circles.dual.dispose()
+    this.pinchTrails.dispose()
+    this.shockwaves.dispose()
     this.particles.dispose()
     this.scene.clear()
     this.renderer.dispose()
@@ -208,9 +234,14 @@ export class EffectManager {
         this.circles[event.hand].updateTarget(this.createHandTarget(event.pose), nowMs)
         break
       }
-      case 'PALM_CLOSE':
+      case 'PALM_CLOSE': {
+        this.circles[event.hand].lose(nowMs)
+        break
+      }
       case 'HAND_LOST': {
         this.circles[event.hand].lose(nowMs)
+        if (this.activePinches.delete(event.hand)) this.blockedPinches.add(event.hand)
+        this.pinchTrails.end(event.hand, nowMs)
         break
       }
       case 'FIST': {
@@ -218,10 +249,15 @@ export class EffectManager {
         const circle = this.circles[event.hand]
         circle.updateTarget(this.createHandTarget(event.pose), nowMs)
         circle.collapse(nowMs, event.intensity)
+        if (this.activePinches.delete(event.hand)) this.blockedPinches.add(event.hand)
+        this.pinchTrails.end(event.hand, nowMs)
         break
       }
       case 'TWO_HAND_CHARGE_START': {
         this.dualActive = true
+        for (const hand of this.activePinches) this.blockedPinches.add(hand)
+        this.activePinches.clear()
+        this.pinchTrails.endAll(nowMs)
         this.circles.left.lose(nowMs)
         this.circles.right.lose(nowMs)
         const target = this.createDualTarget(event.center, event.distance)
@@ -243,6 +279,19 @@ export class EffectManager {
       case 'TWO_HAND_RELEASE': {
         this.dualActive = false
         this.mapPoint(event.center)
+        const releaseStrength = clamp(
+          (Math.abs(event.velocity) - GESTURE_CONFIG.twoHand.releaseVelocity) /
+            Math.max(0.01, 2.2 - GESTURE_CONFIG.twoHand.releaseVelocity),
+          0,
+          1,
+        )
+        this.shockwaves.trigger({
+          x: this.mappedPoint.x,
+          y: this.mappedPoint.y,
+          nowMs,
+          strength: releaseStrength,
+          startRadius: this.lastDualDiameter * 0.42,
+        })
         this.circles.dual.updateTarget(
           {
             x: this.mappedPoint.x,
@@ -254,13 +303,26 @@ export class EffectManager {
           },
           nowMs,
         )
-        this.circles.dual.collapse(nowMs, clamp(1 + Math.abs(event.velocity) * 1.4, 1, 2.4))
+        this.circles.dual.collapse(nowMs, clamp(1 + Math.abs(event.velocity) * 1.4, 1, 2.4), true)
         break
       }
-      case 'PINCH_START':
-      case 'PINCH_MOVE':
+      case 'PINCH_START': {
+        if (this.dualActive || this.blockedPinches.has(event.hand)) break
+        this.activePinches.add(event.hand)
+        this.mapPoint(event.position)
+        this.pinchTrails.start(event.hand, this.mappedPoint.x, this.mappedPoint.y, nowMs)
+        break
+      }
+      case 'PINCH_MOVE': {
+        if (this.dualActive || !this.activePinches.has(event.hand) || this.blockedPinches.has(event.hand)) break
+        this.mapPoint(event.position)
+        this.pinchTrails.move(event.hand, this.mappedPoint.x, this.mappedPoint.y, nowMs)
+        break
+      }
       case 'PINCH_END':
-        // Trail drawing belongs to V1.1; events are intentionally accepted.
+        this.activePinches.delete(event.hand)
+        this.blockedPinches.delete(event.hand)
+        this.pinchTrails.end(event.hand, nowMs)
         break
     }
   }
@@ -274,6 +336,8 @@ export class EffectManager {
     this.circles.left.update(timeMs, deltaSeconds, this.settings, this.particles)
     this.circles.right.update(timeMs, deltaSeconds, this.settings, this.particles)
     this.circles.dual.update(timeMs, deltaSeconds, this.settings, this.particles)
+    this.pinchTrails.update(timeMs, deltaSeconds)
+    this.shockwaves.update(timeMs)
     this.particles.update(timeMs / 1000)
     this.renderer.render(this.scene, this.camera)
 
@@ -282,6 +346,8 @@ export class EffectManager {
       this.onStats({
         renderMs: performance.now() - renderStartedAt,
         activeParticles: this.particles.activeCount,
+        activeTrailSegments: this.pinchTrails.activeSegmentCount,
+        activeShockwaves: this.shockwaves.activeCount,
         drawCalls: this.renderer.info.render.calls,
       })
     }

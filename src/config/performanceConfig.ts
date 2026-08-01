@@ -3,15 +3,28 @@ import type { CameraResolution, PerformanceMode } from '../types/settings'
 export interface PerformancePreset {
   label: string
   inferenceFps: number
+  inferenceLongEdge: number
   dprLimit: number
   particleLimit: number
+  trailSegmentLimit: number
+  trailSpacingPx: number
+  shockwaveLimit: number
   defaultResolution: CameraResolution
 }
 
 export const PERFORMANCE_PRESETS: Record<PerformanceMode, PerformancePreset> = {
-  low: { label: '低性能', inferenceFps: 18, dprLimit: 1, particleLimit: 360, defaultResolution: '640x480' },
-  balanced: { label: '平衡', inferenceFps: 28, dprLimit: 1.5, particleLimit: 720, defaultResolution: '1280x720' },
-  high: { label: '高质量', inferenceFps: 40, dprLimit: 2, particleLimit: 1200, defaultResolution: '1920x1080' },
+  low: {
+    label: '低性能', inferenceFps: 18, inferenceLongEdge: 512, dprLimit: 1, particleLimit: 360,
+    trailSegmentLimit: 96, trailSpacingPx: 9, shockwaveLimit: 2, defaultResolution: '640x480',
+  },
+  balanced: {
+    label: '平衡', inferenceFps: 28, inferenceLongEdge: 640, dprLimit: 1.5, particleLimit: 720,
+    trailSegmentLimit: 192, trailSpacingPx: 6, shockwaveLimit: 4, defaultResolution: '1280x720',
+  },
+  high: {
+    label: '高质量', inferenceFps: 40, inferenceLongEdge: 960, dprLimit: 2, particleLimit: 1200,
+    trailSegmentLimit: 320, trailSpacingPx: 4, shockwaveLimit: 6, defaultResolution: '1920x1080',
+  },
 }
 
 export const RESOLUTION_OPTIONS: Array<{ value: CameraResolution; label: string; width: number; height: number }> = [

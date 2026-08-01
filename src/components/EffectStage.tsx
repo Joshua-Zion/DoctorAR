@@ -29,6 +29,8 @@ export const EffectStage = ({ eventBus, settings, videoRef, metricsRef, onError 
         const metrics = metricsRef.current
         metrics.renderMs = stats.renderMs
         metrics.activeParticles = stats.activeParticles
+        metrics.activeTrailSegments = stats.activeTrailSegments
+        metrics.activeShockwaves = stats.activeShockwaves
         metrics.drawCalls = stats.drawCalls
       })
       if (cancelled) {

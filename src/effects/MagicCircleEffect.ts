@@ -85,6 +85,7 @@ export class MagicCircleEffect {
   private collapseStartOpacity = 0
   private collapseStartScale = 1
   private collapseIntensity = 1
+  private collapseEmitsBurst = true
   private burstEmitted = false
   private ambientBudget = 0
 
@@ -181,13 +182,14 @@ export class MagicCircleEffect {
     this.lostStartOpacity = this.opacity
   }
 
-  collapse(nowMs: number, intensity = 1): void {
+  collapse(nowMs: number, intensity = 1, emitBurst = true): void {
     if (this.disposed || this.phase === 'hidden' || this.phase === 'collapsing') return
     this.phase = 'collapsing'
     this.phaseStartedAt = nowMs
     this.collapseStartOpacity = Math.max(0.35, this.opacity)
     this.collapseStartScale = Math.max(0.25, this.lifecycleScale)
     this.collapseIntensity = clamp(intensity, 0.25, 2.5)
+    this.collapseEmitsBurst = emitBurst
     this.burstEmitted = false
   }
 
@@ -242,7 +244,7 @@ export class MagicCircleEffect {
 
       if (!this.burstEmitted && progress >= 0.42) {
         this.burstEmitted = true
-        if (settings.particlesEnabled) {
+        if (this.collapseEmitsBurst && settings.particlesEnabled) {
           particles.emitBurst({
             x: this.currentX,
             y: this.currentY,

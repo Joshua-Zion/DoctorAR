@@ -27,6 +27,15 @@ function App() {
   const eventBus = useMemo(() => new GestureEventBus(), [])
   const audioManager = useMemo(() => new AudioManager(), [])
 
+  useEffect(() => {
+    if (!import.meta.env.DEV && !new URLSearchParams(window.location.search).has('doctorar-smoke')) return
+    const debugWindow = window as Window & { __DOCTORAR_GESTURE_BUS__?: GestureEventBus }
+    debugWindow.__DOCTORAR_GESTURE_BUS__ = eventBus
+    return () => {
+      delete debugWindow.__DOCTORAR_GESTURE_BUS__
+    }
+  }, [eventBus])
+
   const camera = useCamera(videoRef, {
     enabled: cameraRequested,
     cameraId: settings.cameraId,
@@ -138,7 +147,7 @@ function App() {
 
           {trackingReady ? (
             <div className={`gesture-guide ${handCount > 0 ? 'has-hands' : ''}`}>
-              <span>✦</span> 张开手掌唤醒法阵 · 握拳释放能量 · 双掌相对蓄力
+              <span>✦</span> 张掌唤醒 · 捏合绘制 · 双掌蓄力后快速展开释放冲击波
             </div>
           ) : null}
 

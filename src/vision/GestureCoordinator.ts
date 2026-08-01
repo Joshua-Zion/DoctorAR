@@ -2,8 +2,10 @@ import { GESTURE_CONFIG } from '../config/gestureConfig'
 import type { GesturePose, HandGestureSnapshot } from '../types/gesture'
 import type { HandFrame, Handedness, TrackedHand } from '../types/hand'
 import { saturate } from '../utils/math'
+import { midpoint3 } from '../utils/vector'
 import { GestureEventBus } from './GestureEventBus'
 import { GestureStateMachine, type GestureStateUpdate } from './GestureStateMachine'
+import { TwoHandReleaseDetector } from './TwoHandReleaseDetector'
 
 export interface GestureProcessOptions {
   sensitivity?: number
@@ -43,6 +45,10 @@ export class GestureCoordinator {
     right: createHandMachines(),
   }
   private readonly twoHand = new GestureStateMachine({ ...GESTURE_CONFIG.twoHand })
+  private readonly twoHandRelease = new TwoHandReleaseDetector({
+    releaseVelocity: GESTURE_CONFIG.twoHand.releaseVelocity,
+    cooldownMs: GESTURE_CONFIG.twoHand.cooldownMs,
+  })
   private snapshots: HandGestureSnapshot[] = []
 
   constructor(eventBus: GestureEventBus) {
@@ -128,6 +134,7 @@ export class GestureCoordinator {
       machines.lostEmitted = false
     }
     this.twoHand.reset()
+    this.twoHandRelease.reset()
     this.snapshots = []
   }
 
@@ -151,7 +158,9 @@ export class GestureCoordinator {
       })
     }
 
-    const pinchPosition = hand.landmarks[8] ?? hand.palm.center
+    const thumbTip = hand.landmarks[4] ?? hand.palm.center
+    const indexTip = hand.landmarks[8] ?? hand.palm.center
+    const pinchPosition = midpoint3(thumbTip, indexTip)
     if (pinch.activated) this.eventBus.emit({ type: 'PINCH_START', hand: hand.handedness, position: pinchPosition })
     if (pinch.phase === 'active') this.eventBus.emit({ type: 'PINCH_MOVE', hand: hand.handedness, position: pinchPosition })
     if (pinch.released) this.eventBus.emit({ type: 'PINCH_END', hand: hand.handedness })
@@ -169,6 +178,11 @@ export class GestureCoordinator {
       left && right &&
       frame.timestamp - left.seenAt <= GESTURE_CONFIG.loss.holdMs &&
       frame.timestamp - right.seenAt <= GESTURE_CONFIG.loss.holdMs,
+    )
+    const bothDetectedThisFrame = Boolean(
+      left && right &&
+      Math.abs(frame.timestamp - left.seenAt) < 0.5 &&
+      Math.abs(frame.timestamp - right.seenAt) < 0.5,
     )
     const bothOpen = left && right ? Math.min(left.scores.open, right.scores.open) : 0
     const distanceReady = metric
@@ -188,6 +202,25 @@ export class GestureCoordinator {
       cooldownMs,
     })
 
+    const aspectY = frame.videoHeight / Math.max(1, frame.videoWidth)
+    const axisX = left && right ? right.palm.center.x - left.palm.center.x : 0
+    const axisY = left && right ? (right.palm.center.y - left.palm.center.y) * aspectY : 0
+    const axisLength = Math.hypot(axisX, axisY)
+    const relativeVelocityX = left && right ? right.velocity.x - left.velocity.x : 0
+    const relativeVelocityY = left && right ? (right.velocity.y - left.velocity.y) * aspectY : 0
+    const outwardVelocity = axisLength > 0.0001
+      ? (relativeVelocityX * axisX + relativeVelocityY * axisY) / axisLength
+      : 0
+
+    const release = this.twoHandRelease.update({
+      timestamp: frame.timestamp,
+      distance: metric?.distance ?? 0,
+      distanceVelocity: metric?.distanceVelocity,
+      outwardVelocity,
+      chargeActive: update.phase === 'active',
+      valid: Boolean(metric?.ready && bothDetectedThisFrame),
+    })
+
     if (metric && update.activated) {
       this.eventBus.emit({ type: 'TWO_HAND_CHARGE_START', center: metric.center, distance: metric.distance })
     }
@@ -200,10 +233,10 @@ export class GestureCoordinator {
         velocity: metric.distanceVelocity,
       })
 
-      if (metric.distanceVelocity >= GESTURE_CONFIG.twoHand.releaseVelocity) {
-        this.eventBus.emit({ type: 'TWO_HAND_RELEASE', center: metric.center, velocity: metric.distanceVelocity })
+      if (release.triggered) {
         const forced = this.twoHand.forceRelease(frame.timestamp, cooldownMs)
         if (forced.released) this.eventBus.emit({ type: 'TWO_HAND_CHARGE_END' })
+        this.eventBus.emit({ type: 'TWO_HAND_RELEASE', center: metric.center, velocity: release.filteredVelocity })
         return
       }
     }

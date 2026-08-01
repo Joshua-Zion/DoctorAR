@@ -25,6 +25,7 @@ export interface HandTrackerOptions {
   delegate?: 'GPU' | 'CPU'
   modelPath?: string
   wasmPath?: string
+  useWasmModule?: boolean
 }
 
 interface DetectionCandidate {
@@ -70,7 +71,10 @@ export class HandTracker {
   }
 
   static async create(options: HandTrackerOptions = {}): Promise<HandTracker> {
-    const wasmFileset = await FilesetResolver.forVisionTasks(options.wasmPath ?? HAND_TRACKER_CONFIG.wasmPath)
+    const wasmFileset = await FilesetResolver.forVisionTasks(
+      options.wasmPath ?? HAND_TRACKER_CONFIG.wasmPath,
+      options.useWasmModule,
+    )
     const requestedDelegate = options.delegate ?? 'GPU'
     const createWithDelegate = (delegate: 'GPU' | 'CPU'): Promise<HandLandmarker> => HandLandmarker.createFromOptions(wasmFileset, {
       baseOptions: {
@@ -107,18 +111,31 @@ export class HandTracker {
     smoothing = 0.68,
     sensitivity = 0.58,
   ): HandFrame {
+    const videoWidth = Math.max(1, video.videoWidth || video.clientWidth || 1)
+    const videoHeight = Math.max(1, video.videoHeight || video.clientHeight || 1)
+    return this.detectSource(video, timestampMs, videoWidth, videoHeight, smoothing, sensitivity)
+  }
+
+  detectSource(
+    source: TexImageSource,
+    timestampMs: number,
+    sourceWidth: number,
+    sourceHeight: number,
+    smoothing = 0.68,
+    sensitivity = 0.58,
+  ): HandFrame {
     const landmarker = this.handLandmarker
     if (!landmarker) throw new Error('HandTracker has been disposed')
 
     const timestamp = this.normalizeTimestamp(timestampMs)
-    const videoWidth = Math.max(1, video.videoWidth || video.clientWidth || 1)
-    const videoHeight = Math.max(1, video.videoHeight || video.clientHeight || 1)
+    const videoWidth = Math.max(1, sourceWidth)
+    const videoHeight = Math.max(1, sourceHeight)
     this.mapper.setVideoSize(videoWidth, videoHeight)
     this.normalizedFilter.setSmoothing(smoothing)
     this.worldFilter.setSmoothing(smoothing)
 
     const inferenceStarted = performance.now()
-    const result = landmarker.detectForVideo(video, timestamp)
+    const result = landmarker.detectForVideo(source, timestamp)
     const inferenceMs = performance.now() - inferenceStarted
     const candidates = this.readCandidates(result)
     const assigned = this.assignHandedness(candidates, timestamp)

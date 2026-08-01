@@ -2,7 +2,7 @@
 
 ## 1. 设计目标
 
-DoctorAR V1 的架构围绕四个原则：
+DoctorAR V1 / V1.1 的架构围绕四个原则：
 
 - 摄像头帧和模型推理在浏览器本地完成。
 - 手势识别与视觉特效解耦。
@@ -15,7 +15,8 @@ DoctorAR V1 的架构围绕四个原则：
 
 Camera MediaStream
 → Video Element
-→ HandTracker
+→ resized ImageBitmap
+→ HandTracking Worker / main-thread fallback
 → Hand Feature Derivation
 → Smoothing
 → Gesture Recognizer / State Machine
@@ -47,10 +48,13 @@ Camera MediaStream
 - 提供实际 videoWidth、videoHeight 和 track settings。
 - 监听设备结束、页面可见性和组件卸载。
 
-### HandTracker
+### HandTracker / Worker
 
 - 初始化本地 MediaPipe WASM 和 hand_landmarker.task。
 - 以 VIDEO 模式处理新视频帧，最多识别两只手。
+- 默认按性能预设缩放视频帧并创建可转移 `ImageBitmap`，由 Worker 内的 Hand Landmarker 执行同步推理。
+- 主线程和 Worker 之间只保留一个 in-flight 请求；繁忙时丢弃新帧，不建立不断增长的推理队列。
+- Worker 初始化或首次运行失败时只执行一次受控主线程回退；回退固定限制为最高 18 FPS 和低档输入尺寸，但不承诺无主线程阻塞。
 - 输出原始 landmarks、world landmarks 和 handedness。
 - 不生成视觉特效，也不直接写入 React 组件状态。
 
@@ -63,6 +67,8 @@ Camera MediaStream
 ### Gesture Recognizer / State Machine
 
 - 根据平滑姿态产生张掌、握拳和双手交互状态。
+- 产生捏合生命周期事件，并以拇指尖与食指尖中点作为连续位置。
+- 使用独立历史环形缓冲验证双手必须先靠近，再于 260 ms 窗口内快速展开。
 - 使用 Candidate、Active、Released、Cooldown 等时序状态，禁止单帧直接触发。
 - 负责手势冲突优先级和一次性事件去重。
 - 输出框架无关的共享类型；不得输出 MediaPipe 类实例。
@@ -70,8 +76,8 @@ Camera MediaStream
 ### Effect Manager
 
 - 只消费手势状态、事件和归一化姿态。
-- 创建、更新、渐隐和销毁法阵、爆裂及粒子效果。
-- 管理粒子硬上限、效果复用和 Three.js dispose。
+- 创建、更新、渐隐和销毁法阵、爆裂、捏合能量点、轨迹及冲击波效果。
+- 管理粒子、轨迹段与冲击波固定容量、效果复用和 Three.js dispose。
 - 不导入 MediaPipe，也不读取视频元素。
 
 ### React UI
@@ -97,27 +103,33 @@ MediaPipe 返回未镜像输入图像中的归一化坐标，原点在左上角�
 
 一次性事件用于进入、释放和爆裂，例如：
 
-- PALM_OPEN_START
-- FIST_TRIGGER
-- PALM_END
-- TWO_HAND_START
-- TWO_HAND_END
+- PALM_OPEN
+- FIST
+- PALM_CLOSE
+- TWO_HAND_CHARGE_START
+- PINCH_START
+- PINCH_END
+- TWO_HAND_RELEASE
+- TWO_HAND_CHARGE_END
 
 跟随效果还需要连续更新的平滑姿态，例如：
 
 - hand、position、scale、rotation、opacity
 - center、distance、relativeVelocity
+- pinch midpoint、trail position
 
-只发送开始事件会导致法阵无法继续跟随；只发送逐帧事件又会让爆裂重复触发。因此 V1 明确区分离散生命周期事件和连续姿态更新。
+只发送开始事件会导致法阵无法继续跟随；只发送逐帧事件又会让爆裂重复触发。因此 V1 / V1.1 明确区分离散生命周期事件和连续姿态更新。`PINCH_MOVE` 更新既有轨迹与持续音频参数，不逐帧创建新的音频节点。
 
 ## 7. 调度模型
 
 - Three.js 使用 requestAnimationFrame 持续渲染。
-- 手部推理只处理新视频帧，并可限制到低于显示刷新率的频率。
+- 手部推理优先使用 `requestVideoFrameCallback` 处理新视频帧，不可用时回退 requestAnimationFrame；推理频率可低于显示刷新率。
+- 每个预设限制输入长边；主线程把缩放后的帧作为可转移 `ImageBitmap` 提交给 Worker。
+- 单 in-flight 约束保证 Worker 忙碌时直接丢帧并累计指标，避免延迟随队列增长。
 - UI 统计以较低频率更新。
 - document.hidden 时暂停推理、粒子发射和非必要更新，恢复时重置时间基准。
 
-MediaPipe Web 的 detectForVideo 为同步调用。V1 可通过跳过重复帧和限制推理频率降低影响，但这不等于完全不阻塞主线程。Worker 化列入 V1.1。
+MediaPipe Web 的 `detectForVideo` 为同步调用。V1.1 默认在 Worker 中执行它；Worker 不可用或首次运行失败时受控回退主线程，因此调试面板必须明确显示 `WORKER` 或 `MAIN`，并展示 Worker 往返耗时、推理 FPS 和丢弃帧数，不能把回退路径描述成完全不阻塞。
 
 ## 8. 本地资产与隐私
 
@@ -132,15 +144,29 @@ V1 将模型和 MediaPipe WASM 放在 public 下的本地路径。页面加载�
 1. 停止提交新推理。
 2. 取消 requestAnimationFrame 和其他计时器。
 3. 停止 MediaStream 的全部 tracks，并清空 video.srcObject。
-4. 关闭 Hand Landmarker 和 Worker。
+4. 关闭 Worker 或主线程 Hand Landmarker，并关闭尚未消费的 ImageBitmap。
 5. 移除 resize、visibilitychange、devicechange 等监听器。
 6. dispose geometry、material、texture、render target 和 renderer。
 7. 清空活动效果、粒子和缓存引用。
 
 切换摄像头属于一次局部重启，同样必须先停止旧轨道。
 
-## 10. 后续扩展边界
+## 10. V1.1 渲染扩展
 
-- V1.1 在手势层增加捏合、轨迹和快速展开事件，在特效层增加轨迹、冲击波和音频。
+- `PinchTrailEffect` 用固定容量 InstancedBufferGeometry 绘制轨迹段，并在捏合中点绘制能量点；松开后按寿命衰减。
+- `ShockwaveEffect` 使用固定槽位和单次实例化绘制。终止半径由触发中心到视口最远角计算，确保扩散越过全部可见区域。
+- `pinchTrail` 与 `shockwave` Shader 独立于基础法阵 Shader，分别负责轨迹年龄衰减、流光和冲击波圆环、回波、光束与中心闪光。
+- AudioManager 使用原创 Web Audio 合成持续能量、轨迹和冲击波音色；持续声音通过更新已有节点调制，不随每个移动事件新建节点。
+
+轨迹层只提供自由绘制和简单符号视觉，不包含圆形闭合识别。
+
+## 11. 后续扩展边界
+
 - V2 在视频与特效层之间增加人物 mask/depth 输入，并引入后处理管线。
 - 桌面和移动封装只替换摄像头、文件和窗口适配层，不改变手势事件与特效核心。
+
+## 12. 验证边界
+
+- Vitest 当前有 8 项通过，覆盖严格快速展开的成功与拒绝路径、无效/陈旧双手拒绝、释放事件顺序、捏合生命周期和中点坐标，以及 Worker reset 竞态。
+- 2026-08-01 无头 Edge 假摄像头生产预览烟测确认 Worker 后端、V1.1 实际 WebGL 绘制，以及无页面异常、控制台或网络错误。
+- 真实摄像头、长时间稳定性与跨浏览器测试仍待完成。
